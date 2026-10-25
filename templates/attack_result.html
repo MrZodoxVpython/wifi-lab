@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block content %}
+<section class="hero"><div class="eyebrow">Attack Result</div><h2>{{ attack_name }}</h2><p>{{ now }}</p></section>
+
+<section class="card">
+  <h3>Output Command</h3>
+  <div class="mono">{{ output }}</div>
+  {% if rc == 0 %}
+    <p class="ok">Selesai dengan kode kembali 0.</p>
+  {% else %}
+    <p class="bad">Selesai dengan kode kembali {{ rc }}.</p>
+  {% endif %}
+  <p><a class="btn secondary" href="/">← Kembali ke Dashboard</a></p>
+</section>
+{% endblock %}

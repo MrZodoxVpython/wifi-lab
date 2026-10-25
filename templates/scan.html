@@ -1,0 +1,6 @@
+{% extends "base.html" %}{% block content %}
+<section class="hero"><div class="eyebrow">Passive/standard discovery</div><h2>Hasil pemindaian Wi-Fi</h2><p>Interface: <b>{{ iface }}</b> · {{ now }}. Data berasal dari NetworkManager; jaringan tersembunyi mungkin tidak menampilkan SSID.</p></section>
+<section class="card"><div class="actions"><a class="btn secondary" href="/">← Dashboard</a></div>
+{% if error %}<div class="notice error">{{ error }}</div>{% endif %}
+{% if rows %}<div class="tablewrap"><table><thead><tr><th>SSID</th><th>BSSID</th><th>Channel</th><th>Frequency</th><th>Signal</th><th>Security</th></tr></thead><tbody>{% for r in rows %}<tr><td>{% if r.inuse %}● {% endif %}<a href="/network/{{ iface }}/{{ r.bssid }}"><b>{{ r.ssid }}</b></a></td><td>{{ r.bssid }}</td><td>{{ r.channel }}</td><td>{{ r.freq }} MHz</td><td>{{ r.signal }}%</td><td>{{ r.security }}</td></tr>{% endfor %}</tbody></table></div><p class="small">{{ rows|length }} entri yang dilaporkan NetworkManager.</p>{% elif not error %}<div class="notice">Tidak ada jaringan yang dikembalikan. Pastikan radio Wi-Fi aktif dan NetworkManager berjalan.</div>{% endif %}
+</section>{% endblock %}

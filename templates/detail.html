@@ -1,0 +1,65 @@
+{% extends "base.html" %}{% block content %}
+<section class="hero"><div class="eyebrow">Network Detail</div><h2>{{ network.ssid }}</h2><p>Interface: <b>{{ iface }}</b> · BSSID: <b>{{ network.bssid }}</b> · {{ now }}</p></section>
+
+<section class="card"><h3>📊 Info Jaringan</h3>
+<table>
+  <tr><td>SSID</td><td>{{ network.ssid }}</td></tr>
+  <tr><td>BSSID</td><td>{{ network.bssid }}</td></tr>
+  <tr><td>Channel</td><td>{{ network.channel }}</td></tr>
+  <tr><td>Frequency</td><td>{{ network.freq }} MHz</td></tr>
+  <tr><td>Signal</td><td>{{ network.signal }}%</td></tr>
+  <tr><td>Security</td><td>{{ network.security }}</td></tr>
+</table>
+<p><a class="btn secondary" href="/">← Kembali ke Dashboard</a></p>
+</section>
+
+<section class="card"><h3>⚡ WPS Attack</h3><p class="small">Hanya untuk audit jaringan milik Anda atau yang telah diizinkan. Butuh <b>reaver</b> / <b>bully</b> terinstal dan adaptor dalam monitor mode.</p>
+<form method="post" action="/attack/wps/pixie-dust" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <button type="submit" onclick="return confirm('Jalankan WPS Pixie Dust pada {{ network.ssid }}?')">Pixie Dust</button>
+</form>
+<form method="post" action="/attack/wps/pin-brute" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <button type="submit" onclick="return confirm('Jalankan WPS Pin Brute pada {{ network.ssid }}?')">Pin Brute</button>
+</form>
+<form method="post" action="/attack/wps/common-pins" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <button type="submit" onclick="return confirm('Coba PIN WPS umum pada {{ network.ssid }}?')">Common Pins</button>
+</form>
+<form method="post" action="/attack/wps/custom-pin" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <label>Custom PIN: <input type="text" name="pin" pattern="[0-9]{8}" maxlength="8" title="8 digit PIN"></label>
+  <button type="submit" onclick="return confirm('Serang dengan PIN custom pada {{ network.ssid }}?')">Custom Pin</button>
+</form>
+</section>
+
+<section class="card"><h3>🔑 WPA/WPA2/WPA3 Attack</h3><p class="small">Butuh monitor mode dan file capture yang valid. Tool: <b>aircrack-ng</b>, <b>aireplay-ng</b>, <b>airodump-ng</b>, <b>tshark</b>.</p>
+<form method="post" action="/attack/wpa/pmk-capture" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <button type="submit" onclick="return confirm('Mulai PMK Capture?')">PMK Capture</button>
+</form>
+<form method="post" action="/attack/wpa/hs-capture" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <button type="submit" onclick="return confirm('Mulai Handshake Capture?')">HS Capture</button>
+</form>
+<form method="post" action="/attack/wpa/deauth" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <button type="submit" onclick="return confirm('Kirim Deauth ke {{ network.ssid }}?')">Deauth</button>
+</form>
+<form method="post" action="/attack/wpa/psk-brute" style="display:inline-block;margin-right:8px;">
+  <input type="hidden" name="iface" value="{{ iface }}">
+  <input type="hidden" name="bssid" value="{{ network.bssid }}">
+  <label>Wordlist: <input type="text" name="wordlist" placeholder="/path/to/wordlist.txt"></label>
+  <label>Capture: <input type="text" name="capture" placeholder="/path/to/capture.cap"></label>
+  <button type="submit" onclick="return confirm('Mulai PSK Brute?')">PSK Brute</button>
+</form>
+</section>
+<p><a class="btn secondary" href="/">← Kembali ke Dashboard</a></p>
+{% endblock %}

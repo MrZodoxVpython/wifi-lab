@@ -1,0 +1,26 @@
+{% extends "base.html" %}{% block content %}
+<section class="hero"><div class="eyebrow">Wireless security workspace</div><h2>Wi-Fi reconnaissance.<br>Tanpa keluar dari lab.</h2><p>Kelola interface, lakukan pemindaian standar jaringan sekitar, dan analisis file capture untuk audit yang sah. Fitur radio tingkat rendah bergantung pada chipset dan driver.</p></section>
+<div class="grid">
+<section class="card"><h3>📡 Interface Wi-Fi</h3><p class="muted">Ditemukan oleh `iw dev` pada {{ now }}.</p>
+{% if iface_error %}<div class="notice error">{{ iface_error }}</div>{% endif %}
+{% if ifaces %}<div class="tablewrap"><table><thead><tr><th>Interface</th><th>Type</th><th>PHY</th></tr></thead><tbody>{% for i in ifaces %}<tr><td><b>{{ i.name }}</b></td><td>{{ i.type }}</td><td>{{ i.phy or "—" }}</td></tr>{% endfor %}</tbody></table></div>
+<form method="post" action="/scan"><label for="iface">Pilih interface untuk scan standar</label><select id="iface" name="iface">{% for i in ifaces %}<option value="{{ i.name }}">{{ i.name }} · {{ i.type }}</option>{% endfor %}</select><p><button type="submit">Scan Wi-Fi →</button></p></form>
+{% else %}<div class="notice">Interface belum terdeteksi. Periksa `iw dev`, `ip link`, dan adaptor Wi-Fi.</div>{% endif %}
+</section>
+<section class="card"><h3>🧰 Tool availability</h3><p class="muted">Status utilitas pada sistem lokal. Klik <b>Install</b> untuk memasang via apt.</p>
+{% for t in tools %}
+<div class="toolrow">
+  <div><b>{{ t.name }}</b><div class="small">{{ t.description }}</div></div>
+  <span class="{{ 'ok' if t.installed else 'bad' }}">{{ "Installed" if t.installed else "Missing" }}</span>
+  {% if not t.installed %}
+    <form method="post" action="/install-tool/{{ t.apt }}" style="display:inline;margin-left:8px;">
+      <button type="submit" onclick="return confirm('Instal {{ t.name }} ({{ t.apt }}) via sudo apt-get?')">Install</button>
+    </form>
+  {% endif %}
+</div>
+{% endfor %}
+<p class="small">Butuh hak sudo. Tool akan diinstal secara sistem-wide.</p>
+</section>
+<section class="card"><h3>🗂️ Capture analyzer</h3><p class="muted">Analisis metadata dari file capture milik Anda.</p>{% if capture_files %}<form method="post" action="/analyze"><label for="capture">Pilih file capture</label><select id="capture" name="capture">{% for f in capture_files %}<option value="{{ f }}">{{ f }}</option>{% endfor %}</select><p><button type="submit">Analyze capture →</button></p></form>{% else %}<div class="notice">Belum ada file. Letakkan file .cap, .pcap, atau .pcapng di folder <code>captures/</code>, lalu muat ulang.</div>{% endif %}</section>
+<section class="card"><h3>🛡️ Scope & safety</h3><div class="toolrow"><span>Network scan</span><span class="ok">Standard scan</span></div><div class="toolrow"><span>Dashboard access</span><span class="ok">127.0.0.1</span></div><div class="toolrow"><span>Deauth / injection</span><span class="bad">Not implemented</span></div><div class="toolrow"><span>WPS PIN attack / cracking</span><span class="bad">Not implemented</span></div><p class="small">Program ini tidak mengganggu klien, mengirim frame injeksi, atau menebak password.</p></section>
+</div>{% endblock %}
