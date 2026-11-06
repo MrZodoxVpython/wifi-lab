@@ -1133,6 +1133,219 @@ tbody tr:hover { background: rgba(61, 220, 255, 0.035); }
 }
 .info-tile strong small { font-size: 11px; color: var(--muted-2); font-weight: 400; }
 
+/* --------------------------- ISP & Router info --------------------------- */
+
+.netinfo { margin-bottom: 18px; }
+.netinfo-run { margin-left: auto; flex: none; }
+.netinfo .panel-head { align-items: center; }
+.netinfo .panel-head p { max-width: 62ch; }
+.netinfo-privacy { margin: 0 0 14px; font-size: 12px; color: var(--muted); }
+.netinfo-privacy b { color: #ffd98a; font-weight: 600; }
+
+.netinfo-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 20px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.netinfo-status[hidden] { display: none; }
+.netinfo-status.ok { color: #9ff5d0; }
+.netinfo-status.warn { color: #ffd98a; }
+.netinfo-idle b { color: var(--text); }
+
+.netinfo-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--cyan);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.netinfo-spinner {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 2px solid rgba(61, 220, 255, 0.22);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: netinfoSpin 0.7s linear infinite;
+}
+@keyframes netinfoSpin { to { transform: rotate(360deg); } }
+
+.netinfo-result[hidden] { display: none; }
+.netinfo-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.netinfo-card {
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012));
+}
+.netinfo-card.wide { grid-column: 1 / -1; }
+.netinfo-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 11px;
+}
+.netinfo-kicker {
+  color: var(--muted-2);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+.netinfo-card-head .badge { margin-left: auto; }
+.netinfo-kv { display: grid; gap: 7px; }
+.netinfo-kv > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.netinfo-kv span { flex: none; color: var(--muted-2); font-size: 11px; }
+.netinfo-kv strong {
+  min-width: 0;
+  color: #dbe7fb;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.netinfo-login-meta {
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1px dashed var(--line);
+}
+.netinfo-login-url {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 11px 14px;
+  border: 1px solid rgba(61, 220, 255, 0.22);
+  border-radius: 10px;
+  background: rgba(61, 220, 255, 0.05);
+}
+.netinfo-login-url a {
+  min-width: 0;
+  color: #8cecff;
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.netinfo-login-url a:hover { text-decoration: underline; }
+.netinfo-login-url .netinfo-copy { margin-left: auto; }
+
+.netinfo-creds {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.netinfo-cred {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.18);
+}
+.netinfo-cred span { color: var(--muted-2); font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+.netinfo-cred strong {
+  color: #eef5ff;
+  font-family: var(--mono);
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+.netinfo-copy {
+  justify-self: start;
+  margin-top: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.netinfo-copy:hover { color: var(--cyan); border-color: rgba(61, 220, 255, 0.4); background: rgba(61, 220, 255, 0.08); }
+.netinfo-login-url .netinfo-copy { justify-self: auto; margin-top: 0; }
+
+.netinfo-alts {
+  margin-top: 11px;
+  padding: 9px 11px;
+  border: 1px dashed var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.netinfo-alts span { color: var(--muted-2); }
+.netinfo-alts code { margin: 2px 4px 2px 0; white-space: nowrap; }
+.netinfo-note { margin: 11px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.55; }
+
+.netinfo-evidence {
+  margin: 11px 0 0;
+  padding: 9px 11px 9px 26px;
+  border-left: 2px solid rgba(61, 220, 255, 0.25);
+  background: rgba(61, 220, 255, 0.03);
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.netinfo-evidence li + li { margin-top: 3px; }
+
+.netinfo-warnings { display: grid; gap: 6px; margin-top: 12px; }
+.netinfo-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #ffd98a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.netinfo-warning > span:first-child {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 1px;
+  border: 1px solid rgba(255, 194, 77, 0.4);
+  border-radius: 50%;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+.netinfo-stamp { margin: 10px 0 0; color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; }
+
+.netinfo-empty {
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--muted);
+  font-size: 13px;
+}
+.netinfo-empty.tight { margin-top: 0; padding: 10px 12px; font-size: 12px; }
+.netinfo-empty strong { color: var(--text); }
+.netinfo-empty p { margin: 6px 0 0; }
+.netinfo-empty .small { margin-top: 8px; }
+
 .detail-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
@@ -1660,6 +1873,8 @@ tbody tr:hover { background: rgba(61, 220, 255, 0.035); }
   .main-nav { display: none; }
   .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .info-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .netinfo-grid { grid-template-columns: 1fr; }
+  .netinfo-card.wide { grid-column: auto; }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .terminal-meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -1676,6 +1891,10 @@ tbody tr:hover { background: rgba(61, 220, 255, 0.035); }
   .grid.cols-2 { grid-template-columns: 1fr; }
   .side-stack { grid-template-columns: 1fr; }
   .panel-head, .panel-body { padding: 16px; }
+  .netinfo .panel-head { flex-wrap: wrap; }
+  .netinfo-run { margin-left: 0; }
+  .netinfo-creds { grid-template-columns: 1fr; }
+  .netinfo-login-url .netinfo-copy { margin-left: 0; }
   .detail-hero { padding: 24px 20px; }
   .detail-main h1 { font-size: 30px; }
   .signal-gauge { display: none; }

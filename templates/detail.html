@@ -51,6 +51,39 @@
   <div class="info-tile"><span>Band</span><strong>{{ network.band }}</strong></div>
 </div>
 
+<section class="panel netinfo reveal" id="network-info"
+         data-iface="{{ iface }}"
+         data-bssid="{{ network.bssid }}"
+         data-ssid="{{ network.ssid }}"
+         data-inuse="{{ '1' if network.inuse else '0' }}">
+  <div class="panel-head">
+    <div class="panel-icon green">{{ icons.radar() }}</div>
+    <div>
+      <h2>ISP &amp; Router info</h2>
+      <p>Deteksi ISP, perangkat router, alamat login, dan referensi kredensial default.</p>
+    </div>
+    <button class="btn primary small netinfo-run" type="button" id="run-network-info">
+      {{ icons.activity() }} <span id="run-network-info-label">Run info</span>
+    </button>
+  </div>
+  <div class="panel-body">
+    <div class="notice netinfo-privacy">
+      <span>
+        Lookup ISP mengirim IP publik ke layanan pihak ketiga (ipinfo.io / ifconfig.co).
+        Username dan password router yang ditampilkan adalah <b>referensi default pabrik</b>,
+        bukan hasil pembacaan password dari perangkat.
+      </span>
+    </div>
+    <div class="netinfo-status" id="netinfo-status" role="status" aria-live="polite">
+      <span class="netinfo-idle">
+        Klik <b>Run info</b> untuk memeriksa koneksi, ISP, router, dan alamat login.
+        Deteksi hanya berjalan jika perangkat terhubung ke Wi-Fi ini.
+      </span>
+    </div>
+    <div class="netinfo-result" id="netinfo-result" hidden></div>
+  </div>
+</section>
+
 <div class="detail-layout">
   <div class="detail-column">
 
@@ -341,4 +374,7 @@
   </aside>
 </div>
 
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/network-info.js') }}" defer></script>
 {% endblock %}

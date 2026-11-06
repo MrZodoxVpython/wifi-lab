@@ -7,6 +7,9 @@ started by the operator. The dashboard binds to localhost only.
 """
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 import subprocess, shutil, re, os, sys, threading, time, uuid
+import html, ipaddress, json, socket, ssl, urllib.error, urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import unquote
@@ -491,6 +494,801 @@ def scan_wifi(iface):
             "secure": meta["secure"],
         })
     return rows, ""
+
+
+# ---------------------------------------------------------------------------
+# ISP & router discovery — only runs when the selected interface is actually
+# connected to the target network. No login attempts are made: router access
+# data is reported as a factory-default reference the operator can verify.
+# ---------------------------------------------------------------------------
+_OUI_CACHE = {"loaded": False, "map": {}, "source": ""}
+_OUI_LOCK = threading.Lock()
+_OUI_FILES = (
+    "/usr/share/nmap/nmap-mac-prefixes",
+    "/usr/share/arp-scan/ieee-oui.txt",
+    "/usr/share/ieee-data/oui.txt",
+    "/usr/share/wireshark/manuf",
+)
+
+ROUTER_BRANDS = (
+    ("TP-Link", ("tp-link", "tplink", "archer", "deco", "omada", "mercusys")),
+    ("ZTE", ("zte", "zxhn")),
+    ("Huawei", ("huawei", "honor", "hg8", "eg8")),
+    ("FiberHome", ("fiberhome", "an5506", "hg6")),
+    ("Nokia", ("nokia", "alcatel", "ont-", "g-140w")),
+    ("Tenda", ("tenda",)),
+    ("D-Link", ("d-link", "dlink", "dir-")),
+    ("Netgear", ("netgear", "orbi", "nighthawk")),
+    ("Asus", ("asus", "rt-", "zenwifi")),
+    ("Linksys", ("linksys", "velop")),
+    ("Cisco", ("cisco", "scientific atlanta")),
+    ("MikroTik", ("mikrotik", "routeros", "routerboard")),
+    ("Ubiquiti", ("ubiquiti", "unifi", "edge router", "airrouter")),
+    ("Xiaomi", ("xiaomi", "mi router", "redmi")),
+    ("TOTOLINK", ("totolink",)),
+    ("Ruijie", ("ruijie", "reyee")),
+    ("Cudy", ("cudy",)),
+    ("Zyxel", ("zyxel",)),
+    ("DrayTek", ("draytek", "vigor")),
+    ("Arris", ("arris", "touchstone")),
+    ("Technicolor", ("technicolor", "thomson")),
+    ("Sagemcom", ("sagemcom",)),
+    ("Hitron", ("hitron",)),
+    ("Sercomm", ("sercomm",)),
+    ("Samsung", ("samsung", "smartthings")),
+    ("Xiaomi", ("xiaomi",)),
+)
+
+DEFAULT_LOGIN_REFERENCES = (
+    {"brand": "TP-Link", "keys": ("tp-link", "tplink", "archer", "deco", "omada", "mercusys"),
+     "username": "admin", "password": "admin"},
+    {"brand": "ZTE", "keys": ("zte", "zxhn"),
+     "username": "admin", "password": "admin",
+     "alternatives": [("admin", ""), ("user", "user"), ("telecomadmin", "admintelecom")]},
+    {"brand": "Huawei", "keys": ("huawei", "honor", "hg8", "eg8"),
+     "username": "admin", "password": "admin",
+     "alternatives": [("telecomadmin", "admintelecom"), ("root", "admin")]},
+    {"brand": "FiberHome", "keys": ("fiberhome", "an5506", "hg6"),
+     "username": "admin", "password": "admin",
+     "alternatives": [("user", "user"), ("admin", "1234")]},
+    {"brand": "Nokia", "keys": ("nokia", "alcatel", "ont-", "g-140w"),
+     "username": "admin", "password": "admin",
+     "alternatives": [("user", "user"), ("telecomadmin", "admintelecom")]},
+    {"brand": "Tenda", "keys": ("tenda",),
+     "username": "admin", "password": "admin",
+     "alternatives": [("admin", "")]},
+    {"brand": "D-Link", "keys": ("d-link", "dlink", "dir-"),
+     "username": "admin", "password": "",
+     "alternatives": [("admin", "admin"), ("Admin", "admin")]},
+    {"brand": "Netgear", "keys": ("netgear", "orbi", "nighthawk"),
+     "username": "admin", "password": "password",
+     "alternatives": [("admin", "admin")]},
+    {"brand": "Asus", "keys": ("asus", "rt-", "zenwifi"),
+     "username": "admin", "password": "admin"},
+    {"brand": "Linksys", "keys": ("linksys", "velop"),
+     "username": "admin", "password": "admin"},
+    {"brand": "Cisco", "keys": ("cisco", "scientific atlanta"),
+     "username": "admin", "password": "admin",
+     "alternatives": [("admin", "password"), ("cisco", "cisco")]},
+    {"brand": "MikroTik", "keys": ("mikrotik", "routeros", "routerboard"),
+     "username": "admin", "password": "",
+     "alternatives": [("admin", "admin")]},
+    {"brand": "Ubiquiti", "keys": ("ubiquiti", "unifi", "edge router", "airrouter"),
+     "username": "ubnt", "password": "ubnt",
+     "alternatives": [("admin", "admin")]},
+    {"brand": "Xiaomi", "keys": ("xiaomi", "mi router", "redmi"),
+     "username": "admin", "password": "",
+     "alternatives": [("admin", "admin")]},
+    {"brand": "TOTOLINK", "keys": ("totolink",),
+     "username": "admin", "password": "admin"},
+    {"brand": "Ruijie", "keys": ("ruijie", "reyee"),
+     "username": "admin", "password": "admin"},
+    {"brand": "Cudy", "keys": ("cudy",),
+     "username": "admin", "password": "admin"},
+    {"brand": "Zyxel", "keys": ("zyxel",),
+     "username": "admin", "password": "1234",
+     "alternatives": [("admin", "admin")]},
+    {"brand": "DrayTek", "keys": ("draytek", "vigor"),
+     "username": "admin", "password": "admin"},
+    {"brand": "Arris", "keys": ("arris", "touchstone"),
+     "username": "admin", "password": "password",
+     "alternatives": [("admin", "admin")]},
+    {"brand": "Technicolor", "keys": ("technicolor", "thomson"),
+     "username": "admin", "password": "admin"},
+    {"brand": "Sagemcom", "keys": ("sagemcom",),
+     "username": "admin", "password": "admin"},
+    {"brand": "Hitron", "keys": ("hitron",),
+     "username": "admin", "password": "password",
+     "alternatives": [("admin", "admin")]},
+    {"brand": "Sercomm", "keys": ("sercomm",),
+     "username": "admin", "password": "admin"},
+    {"brand": "Generic", "keys": (),
+     "username": "admin", "password": "admin",
+     "alternatives": [("admin", "password"), ("admin", ""), ("user", "user")]},
+)
+
+
+def _run_json(args, timeout=8):
+    rc, out, err = run_cmd(args, timeout=timeout)
+    if rc != 0 or not out:
+        return None
+    try:
+        return json.loads(out)
+    except (ValueError, TypeError):
+        return None
+
+
+def _load_oui():
+    """Muat database OUI lokal (nmap/arp-scan/IEEE) sekali saja."""
+    with _OUI_LOCK:
+        if _OUI_CACHE["loaded"]:
+            return _OUI_CACHE["map"]
+        mapping = {}
+        source = ""
+        for path in _OUI_FILES:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split(None, 1)
+                        if len(parts) < 2:
+                            continue
+                        prefix = re.sub(r"[^0-9A-Fa-f]", "", parts[0]).upper()
+                        if len(prefix) < 6:
+                            continue
+                        vendor = parts[1].split("\t")[0].strip()
+                        key = prefix[:6]
+                        if vendor and "\\" not in vendor:
+                            mapping.setdefault(key, vendor)
+                source = path
+                break
+            except OSError:
+                continue
+        _OUI_CACHE.update({"loaded": True, "map": mapping, "source": source})
+        return mapping
+
+
+def _oui_vendor(mac):
+    clean = re.sub(r"[^0-9A-Fa-f]", "", mac or "").upper()
+    if len(clean) < 6:
+        return ""
+    return _load_oui().get(clean[:6], "")
+
+
+def _ipv4_info(iface):
+    data = _run_json(["ip", "-j", "addr", "show", "dev", iface])
+    addresses = []
+    if isinstance(data, list):
+        for entry in data:
+            for item in entry.get("addr_info", []) or []:
+                if item.get("family") == "inet" and item.get("local"):
+                    addresses.append({
+                        "address": item["local"],
+                        "prefix": item.get("prefixlen"),
+                    })
+    return addresses
+
+
+def _default_gateway(iface=None):
+    data = _run_json(["ip", "-j", "route", "show", "default"])
+    if isinstance(data, list):
+        for route in data:
+            if route.get("dst") not in (None, "default"):
+                continue
+            if iface and route.get("dev") != iface:
+                continue
+            if route.get("gateway"):
+                return route["gateway"]
+    rc, out, _ = run_cmd(["ip", "route", "show", "default"], timeout=6)
+    if rc == 0:
+        for line in out.splitlines():
+            match = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", line)
+            if match and (not iface or f"dev {iface}" in line):
+                return match.group(1)
+    return ""
+
+
+def _dns_servers(iface):
+    rc, out, _ = run_cmd(["nmcli", "-t", "-f", "IP4.DNS", "device", "show", iface], timeout=8)
+    servers = []
+    if rc == 0:
+        for line in out.splitlines():
+            if ":" in line:
+                value = line.split(":", 1)[1].strip()
+                if value and value not in servers:
+                    servers.append(value)
+    if not servers:
+        try:
+            with open("/etc/resolv.conf", "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if line.startswith("nameserver"):
+                        value = line.split()[1]
+                        if value not in servers:
+                            servers.append(value)
+        except OSError:
+            pass
+    return servers[:4]
+
+
+def _wifi_link(iface):
+    link = {
+        "iface": iface,
+        "connected": False,
+        "ssid": "",
+        "bssid": "",
+        "freq": "",
+        "signal_dbm": None,
+        "bitrate": "",
+        "mode": "",
+    }
+    if not _validate_iface(iface):
+        return link
+    rc, out, _ = run_cmd(["iw", "dev", iface, "link"], timeout=8)
+    text = out or ""
+    if rc == 0 and text and "Not connected" not in text:
+        match = re.search(r"Connected to ([0-9A-Fa-f:]{17})", text)
+        if match:
+            link["bssid"] = match.group(1).upper()
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("SSID:"):
+                link["ssid"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("freq:"):
+                link["freq"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("signal:"):
+                value = stripped.split(":", 1)[1].strip().split()[0]
+                try:
+                    link["signal_dbm"] = int(value)
+                except ValueError:
+                    pass
+            elif stripped.startswith("tx bitrate:"):
+                link["bitrate"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("rx bitrate:") and not link["bitrate"]:
+                link["bitrate"] = stripped.split(":", 1)[1].strip()
+
+    if not link["bssid"]:
+        # Fallback NetworkManager agar informasi tetap muncul pada driver tertentu.
+        rc, out, _ = run_cmd(
+            ["nmcli", "-t", "-f", "ACTIVE,SSID,BSSID", "device", "wifi", "list", "ifname", iface],
+            timeout=10,
+        )
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 8 and parts[0] == "yes":
+                    link["ssid"] = ":".join(parts[1:-6]).replace("\\:", ":")
+                    bssid = _normalize_mac(":".join(parts[-6:]))
+                    if _validate_bssid(bssid):
+                        link["bssid"] = bssid.upper()
+                    break
+
+    link["connected"] = bool(link["bssid"])
+    if link["connected"]:
+        link["ipv4"] = _ipv4_info(iface)
+        link["gateway"] = _default_gateway(iface)
+        link["dns"] = _dns_servers(iface)
+    return link
+
+
+def _neighbor_mac(ip):
+    if not ip:
+        return ""
+
+    def read():
+        rc, out, _ = run_cmd(["ip", "neigh", "show", ip], timeout=5)
+        if rc == 0:
+            match = re.search(r"lladdr ([0-9A-Fa-f:]{17})", out)
+            if match:
+                return match.group(1).upper()
+        return ""
+
+    mac = read()
+    if mac:
+        return mac
+    # Kirim paket UDP kecil agar kernel melakukan ARP/NDP, lalu baca ulang.
+    for port in (53, 80):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.4)
+            sock.sendto(b"\x00", (ip, port))
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.close()
+            except (OSError, UnboundLocalError):
+                pass
+        time.sleep(0.25)
+        mac = read()
+        if mac:
+            return mac
+    return ""
+
+
+def _host_is_private(host):
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+        return address.is_private or address.is_loopback or address.is_link_local
+    except ValueError:
+        pass
+    try:
+        resolved = socket.gethostbyname(host)
+        return _host_is_private(resolved)
+    except (OSError, socket.gaierror):
+        return False
+
+
+def _safe_lan_url(url):
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except (ValueError, TypeError):
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    if not _host_is_private(parsed.hostname):
+        return ""
+    return url
+
+
+def _http_get(url, timeout=3.0, max_bytes=200000, lan_only=False):
+    if lan_only and not _safe_lan_url(url):
+        raise ValueError("URL tidak diizinkan")
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) STRYKER/1.0",
+            "Accept": "text/html,application/xml,application/json;q=0.9,*/*;q=0.8",
+            "Connection": "close",
+        },
+    )
+    # HTTPS router admin sering memakai sertifikat self-signed, jadi verifikasi
+    # hanya dilonggarkan untuk probe LAN. Lookup ISP tetap memverifikasi TLS.
+    context = ssl._create_unverified_context() if lan_only else None
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        raw = response.read(max_bytes)
+        charset = response.headers.get_content_charset() or "utf-8"
+        return {
+            "status": getattr(response, "status", 200),
+            "url": response.geturl(),
+            "headers": {key.lower(): value for key, value in response.headers.items()},
+            "text": raw.decode(charset, errors="replace"),
+        }
+
+
+def _http_json(url, timeout=6.0):
+    result = _http_get(url, timeout=timeout, max_bytes=120000)
+    return json.loads(result["text"])
+
+
+def _upnp_discover(timeout=2.5):
+    target = "239.255.255.250"
+    port = 1900
+    message = "\r\n".join([
+        "M-SEARCH * HTTP/1.1",
+        f"HOST: {target}:{port}",
+        'MAN: "ssdp:discover"',
+        "MX: 1",
+        "ST: ssdp:all",
+        "", "",
+    ]).encode()
+    locations = []
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(0.5)
+        sock.sendto(message, (target, port))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, _ = sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            text = data.decode("utf-8", errors="replace")
+            match = re.search(r"^location:\s*(\S+)", text, re.I | re.M)
+            if match:
+                location = match.group(1).strip()
+                if location not in locations:
+                    locations.append(location)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except (OSError, UnboundLocalError):
+            pass
+
+    info = {}
+    for location in locations[:2]:
+        try:
+            if not _safe_lan_url(location):
+                continue
+            result = _http_get(location, timeout=2.5, max_bytes=80000, lan_only=True)
+            root = ET.fromstring(result["text"])
+        except (ValueError, OSError, ET.ParseError):
+            continue
+        values = {}
+        for node in root.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag in ("friendlyName", "manufacturer", "manufacturerURL", "modelName",
+                       "modelNumber", "modelDescription", "deviceType", "presentationURL",
+                       "serialNumber") and (node.text or "").strip():
+                values.setdefault(tag, node.text.strip())
+        if values:
+            # presentationURL relatif terhadap LOCATION
+            presentation = values.get("presentationURL", "")
+            if presentation and not presentation.lower().startswith(("http://", "https://")):
+                values["adminURL"] = urllib.parse.urljoin(location, presentation)
+            elif presentation:
+                values["adminURL"] = presentation
+            info = values
+            info["location"] = location
+            break
+    return info
+
+
+MODEL_PATTERNS = (
+    r"\bZXHN\s+F\d{3,4}[A-Z]?\b",
+    r"\b(?:HG|EG|AN|F|G)\d{3,4}[A-Z]?\b",
+    r"\bArcher\s+[A-Z0-9]{2,10}\b",
+    r"\bTL-[A-Z0-9]{3,12}\b",
+    r"\bDIR-\d{3,4}[A-Z]?\b",
+    r"\bRT-[A-Z0-9]{2,10}\b",
+    r"\bVR-\d{3,4}\b",
+)
+
+
+def _guess_model(text):
+    source = (text or "").strip()
+    if not source:
+        return ""
+    for pattern in MODEL_PATTERNS:
+        match = re.search(pattern, source, re.I)
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
+def _probe_router_http(gateway):
+    hosts = [gateway] if gateway else []
+    candidates = []
+    for host in hosts:
+        candidates.extend([
+            f"http://{host}/",
+            f"http://{host}:8080/",
+            f"https://{host}/",
+            f"http://{host}:8000/",
+        ])
+    if not candidates:
+        return []
+
+    def probe(url):
+        try:
+            result = _http_get(url, timeout=2.2, max_bytes=120000, lan_only=True)
+        except (ValueError, OSError):
+            return None
+        text = result["text"]
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+        title = html.unescape(re.sub(r"\s+", " ", title_match.group(1)).strip())[:160] if title_match else ""
+        auth = result["headers"].get("www-authenticate", "")
+        generator = ""
+        gen_match = re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', text, re.I)
+        if gen_match:
+            generator = html.unescape(gen_match.group(1))[:80]
+        server = result["headers"].get("server", "")[:120]
+        lowered = text.lower()
+        hints = [brand for brand, keys in ROUTER_BRANDS if any(key in lowered for key in keys)]
+        return {
+            "url": result["url"],
+            "status": result["status"],
+            "title": title,
+            "server": server,
+            "auth": auth[:120],
+            "generator": generator,
+            "hints": hints[:4],
+            "model": _guess_model(title),
+            "login_form": bool(re.search(r"type=[\"']?password", text, re.I)),
+        }
+
+    probes = []
+    with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as pool:
+        for result in pool.map(probe, candidates):
+            if result:
+                probes.append(result)
+    probes.sort(key=lambda item: (not (item["login_form"] or item["title"]), item["status"] != 200))
+    return probes
+
+
+def _isp_lookup(timeout=6.0):
+    warnings = []
+    try:
+        data = _http_json("https://ipinfo.io/json", timeout=timeout)
+        org = (data.get("org") or "").strip()
+        asn = ""
+        isp = org
+        match = re.match(r"^(AS\d+)\s+(.*)$", org)
+        if match:
+            asn = match.group(1)
+            isp = match.group(2)
+        return {
+            "source": "ipinfo.io",
+            "public_ip": data.get("ip", ""),
+            "isp": isp,
+            "org": org,
+            "asn": asn,
+            "city": data.get("city", ""),
+            "region": data.get("region", ""),
+            "country": data.get("country", ""),
+            "loc": data.get("loc", ""),
+            "timezone": data.get("timezone", ""),
+        }, warnings
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        warnings.append(f"ipinfo.io tidak dapat dihubungi: {exc}")
+
+    try:
+        data = _http_json("https://ifconfig.co/json", timeout=timeout)
+        return {
+            "source": "ifconfig.co",
+            "public_ip": data.get("ip", ""),
+            "isp": data.get("asn_org", "") or data.get("asn_org", ""),
+            "org": data.get("asn_org", ""),
+            "asn": f"AS{data['asn']}" if data.get("asn") else "",
+            "city": data.get("city", ""),
+            "region": data.get("region_name", ""),
+            "country": data.get("country_iso", data.get("country", "")),
+            "loc": "",
+            "timezone": data.get("time_zone", ""),
+        }, warnings
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        warnings.append(f"ifconfig.co tidak dapat dihubungi: {exc}")
+
+    return {"error": "Lookup ISP eksternal gagal."}, warnings
+
+
+def _detect_brand(blob):
+    text = (blob or "").lower()
+    if not text.strip():
+        return ""
+    for brand, keys in ROUTER_BRANDS:
+        if any(key in text for key in keys):
+            return brand
+    return ""
+
+
+def _default_login_reference(brand, model, blob):
+    if brand:
+        for entry in DEFAULT_LOGIN_REFERENCES:
+            if entry["brand"].lower() == brand.lower():
+                return entry
+    model_text = (model or "").lower()
+    if model_text:
+        for entry in DEFAULT_LOGIN_REFERENCES:
+            if entry["brand"] != "Generic" and any(key in model_text for key in entry["keys"]):
+                return entry
+    text = (blob or "").lower()
+    for entry in DEFAULT_LOGIN_REFERENCES:
+        if entry["brand"] != "Generic" and any(key in text for key in entry["keys"]):
+            return entry
+    return DEFAULT_LOGIN_REFERENCES[-1]
+
+
+def _credential_block(entry, source_note):
+    def pairs(item):
+        values = [(item["username"], item["password"])]
+        for username, password in item.get("alternatives", []):
+            values.append((username, password))
+        return [{"username": username, "password": password} for username, password in values]
+
+    return {
+        "brand": entry["brand"],
+        "username": entry["username"],
+        "password": entry["password"],
+        "alternatives": pairs(entry)[1:],
+        "verified": False,
+        "source": source_note,
+    }
+
+
+def network_info_snapshot(iface, bssid, ssid):
+    """Kumpulkan info ISP/router. Hanya melakukan lookup bila target terhubung."""
+    bssid = (_normalize_mac(bssid) or "").upper()
+    result = {
+        "ok": True,
+        "connected": False,
+        "target": {"iface": iface, "ssid": ssid, "bssid": bssid},
+        "link": {},
+        "isp": {},
+        "router": {},
+        "login": {},
+        "warnings": [],
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    def matches_target(candidate):
+        if not candidate.get("connected"):
+            return False
+        if candidate.get("bssid", "").upper() == bssid:
+            return True
+        # Roaming/mesh: SSID sama tetapi BSSID berbeda tetap dianggap jaringan target.
+        return bool(ssid and candidate.get("ssid") == ssid)
+
+    active_iface = ""
+    link = _wifi_link(iface)
+    if matches_target(link):
+        active_iface = iface
+    else:
+        # Cari interface lain yang mungkin terhubung ke jaringan target.
+        for candidate in interfaces()[0]:
+            name = candidate.get("name", "")
+            if name == iface or not _validate_iface(name):
+                continue
+            other = _wifi_link(name)
+            if matches_target(other):
+                active_iface = name
+                link = other
+                break
+
+    result["link"] = link
+    if not active_iface:
+        if link.get("connected"):
+            message = (
+                f"Interface {iface} sedang terhubung ke {link.get('ssid') or 'jaringan lain'} "
+                f"({link.get('bssid')}), bukan ke target {ssid or bssid}. "
+                "Sambungkan ke Wi-Fi target terlebih dahulu."
+            )
+        else:
+            message = (
+                f"Interface {iface} tidak terhubung ke Wi-Fi mana pun. "
+                "Sambungkan ke jaringan target, lalu klik Run info lagi."
+            )
+        result["message"] = message
+        result["warnings"].append(
+            "Info ISP, router, dan login hanya bisa dideteksi saat perangkat terhubung ke jaringan target."
+        )
+        return result
+
+    result["connected"] = True
+    result["target"]["iface"] = active_iface
+    if link.get("bssid", "").upper() != bssid:
+        result["warnings"].append(
+            f"Terhubung ke SSID {link.get('ssid')!r} melalui BSSID {link.get('bssid')} "
+            f"(target {bssid}). Kemungkinan roaming/mesh; info gateway tetap dari koneksi aktif."
+        )
+    link["gateway"] = link.get("gateway") or _default_gateway(active_iface)
+    gateway = link.get("gateway", "")
+    if not gateway:
+        result["warnings"].append(
+            "Gateway IPv4 tidak terdeteksi. Login router tidak bisa ditentukan; "
+            "periksa konfigurasi DHCP atau koneksi IPv6-only."
+        )
+    gateway_mac = _neighbor_mac(gateway) if gateway else ""
+    vendor = _oui_vendor(gateway_mac) if gateway_mac else ""
+
+    try:
+        gateway_hostname = socket.gethostbyaddr(gateway)[0] if gateway else ""
+    except (OSError, socket.herror, socket.gaierror):
+        gateway_hostname = ""
+
+    # Lookup eksternal, UPnP, dan HTTP router berjalan paralel.
+    upnp = {}
+    probes = []
+    isp = {"error": "Lookup tidak dijalankan."}
+    isp_warnings = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        future_isp = pool.submit(_isp_lookup)
+        future_upnp = pool.submit(_upnp_discover)
+        future_http = pool.submit(_probe_router_http, gateway)
+        try:
+            isp, isp_warnings = future_isp.result(timeout=12)
+        except Exception as exc:  # noqa: BLE001 - jangan gagalkan seluruh panel
+            isp = {"error": f"Lookup ISP gagal: {exc}"}
+        try:
+            upnp = future_upnp.result(timeout=8)
+        except Exception as exc:  # noqa: BLE001
+            isp_warnings.append(f"UPnP discovery gagal: {exc}")
+        try:
+            probes = future_http.result(timeout=12)
+        except Exception as exc:  # noqa: BLE001
+            isp_warnings.append(f"HTTP fingerprint gagal: {exc}")
+
+    result["warnings"].extend(isp_warnings)
+    result["isp"] = isp
+
+    principal = probes[0] if probes else {}
+    upnp_blob = " ".join(str(value) for value in upnp.values()) if upnp else ""
+    probe_blob = " ".join(
+        f"{item.get('title', '')} {item.get('server', '')} {item.get('generator', '')} "
+        f"{' '.join(item.get('hints', []))} {item.get('model', '')}"
+        for item in probes
+    )
+    blob = " ".join([vendor, upnp_blob, probe_blob])
+    model = upnp.get("modelName", "") or principal.get("model", "")
+    http_identity = " ".join([
+        principal.get("title", ""),
+        principal.get("server", ""),
+        principal.get("generator", ""),
+    ])
+    # Prioritaskan identitas yang paling kuat: OUI gateway, lalu UPnP, lalu HTTP.
+    brand = _detect_brand(vendor) or _detect_brand(upnp_blob) or _detect_brand(http_identity)
+    if not brand:
+        for hint in principal.get("hints", []) or []:
+            brand = hint
+            break
+    admin_url = upnp.get("adminURL") or principal.get("url") or (f"http://{gateway}/" if gateway else "")
+    oui_name = _detect_brand(vendor) or vendor
+
+    result["router"] = {
+        "gateway": gateway,
+        "gateway_hostname": gateway_hostname,
+        "mac": gateway_mac,
+        "vendor_oui": oui_name,
+        "brand": brand,
+        "manufacturer": upnp.get("manufacturer", ""),
+        "model": model,
+        "model_number": upnp.get("modelNumber", ""),
+        "friendly_name": upnp.get("friendlyName", ""),
+        "admin_url": admin_url,
+        "http": principal,
+        "upnp": upnp,
+        "evidence": [
+            item for item in (
+                f"MAC OUI: {oui_name}" if oui_name else "",
+                f"UPnP: {upnp.get('manufacturer', '')} {upnp.get('modelName', '')}".strip() if upnp else "",
+                f"HTTP title: {principal.get('title', '')}" if principal.get("title") else "",
+                f"HTTP server: {principal.get('server', '')}" if principal.get("server") else "",
+                f"Model dari halaman login: {principal.get('model', '')}" if principal.get("model") else "",
+            ) if item
+        ],
+    }
+
+    login_entry = _default_login_reference(brand, model, blob)
+    result["login"] = {
+        "ip": gateway,
+        "url": admin_url,
+        "hostname": gateway_hostname,
+        "credentials": _credential_block(
+            login_entry,
+            "Referensi kredensial default pabrik — belum diverifikasi dan bisa sudah diubah.",
+        ),
+        "note": (
+            "Kata sandi router tidak dapat dibaca dari luar perangkat. Yang ditampilkan adalah "
+            "referensi default pabrik; pada ONT/ISP, kredensial asli biasanya tercetak di stiker "
+            "perangkat. Coba hanya pada router yang Anda miliki/berizin."
+        ),
+    }
+
+    if not vendor and not upnp and not probes:
+        result["warnings"].append(
+            "Router tidak merespons fingerprint. Panel login memakai gateway default; "
+            "beberapa router memblokir probe lokal."
+        )
+    result["warnings"].append(
+        "Lookup ISP mengirim IP publik ke layanan pihak ketiga (ipinfo.io / ifconfig.co). "
+        "Gunakan hanya pada jaringan yang Anda berwenang audit."
+    )
+    return result
+
+
+@app.route("/api/network-info")
+def network_info():
+    iface = request.args.get("iface", "").strip()
+    bssid = _normalize_mac(request.args.get("bssid", "").strip())
+    ssid = request.args.get("ssid", "").strip()[:64]
+    if not _validate_iface(iface) or not _validate_bssid(bssid):
+        return jsonify({"ok": False, "error": "Parameter interface atau BSSID tidak valid."}), 400
+    try:
+        return jsonify(network_info_snapshot(iface, bssid, ssid))
+    except Exception as exc:  # noqa: BLE001 - API harus selalu mengembalikan JSON
+        app.logger.exception("network-info gagal")
+        return jsonify({
+            "ok": False,
+            "error": f"Gagal mengumpulkan info jaringan: {exc}",
+        }), 500
 
 
 TOOL_APT_MAP = {
