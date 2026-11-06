@@ -1,65 +1,332 @@
-{% extends "base.html" %}{% block content %}
-<section class="hero"><div class="eyebrow">Network Detail</div><h2>{{ network.ssid }}</h2><p>Interface: <b>{{ iface }}</b> · BSSID: <b>{{ network.bssid }}</b> · {{ now }}</p></section>
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% block title %}{{ network.ssid }} · STRYKER{% endblock %}
+{% block content %}
 
-<section class="card"><h3>📊 Info Jaringan</h3>
-<table>
-  <tr><td>SSID</td><td>{{ network.ssid }}</td></tr>
-  <tr><td>BSSID</td><td>{{ network.bssid }}</td></tr>
-  <tr><td>Channel</td><td>{{ network.channel }}</td></tr>
-  <tr><td>Frequency</td><td>{{ network.freq }} MHz</td></tr>
-  <tr><td>Signal</td><td>{{ network.signal }}%</td></tr>
-  <tr><td>Security</td><td>{{ network.security }}</td></tr>
-</table>
-<p><a class="btn secondary" href="/">← Kembali ke Dashboard</a></p>
+<nav class="breadcrumb reveal">
+  <a href="{{ url_for('index') }}">Dashboard</a><span>/</span><span>Network detail</span>
+</nav>
+
+<section class="detail-hero reveal">
+  <div class="detail-main">
+    <span class="eyebrow"><i class="pulse-dot"></i> Target profile</span>
+    <h1>{{ network.ssid }}</h1>
+    <p class="meta-line">
+      <span class="mono">{{ network.bssid }}</span>
+      <span class="dot-sep">·</span>
+      Interface <b class="mono">{{ iface }}</b>
+      <span class="dot-sep">·</span>
+      {{ now }}
+    </p>
+    <div class="detail-badges">
+      <span class="sec-badge {{ network.security_class }}">{{ network.security_label }}</span>
+      <span class="badge">{{ network.band }}</span>
+      <span class="badge">CH {{ network.channel }}</span>
+      {% if network.inuse %}<span class="badge green">CONNECTED</span>{% endif %}
+      {% if network.hidden %}<span class="badge">HIDDEN SSID</span>{% endif %}
+    </div>
+    <div class="detail-actions">
+      <a class="btn ghost small" href="{{ url_for('network_detail', iface=iface, bssid=network.bssid) }}">{{ icons.refresh() }} Refresh</a>
+      <form method="post" action="{{ url_for('scan') }}" style="margin:0">
+        <input type="hidden" name="iface" value="{{ iface }}">
+        <button class="btn ghost small" type="submit">{{ icons.radar() }} Hasil scan</button>
+      </form>
+      <a class="btn ghost small" href="{{ url_for('index') }}">{{ icons.arrow() }} Dashboard</a>
+      <button class="btn ghost small" type="button" data-copy="{{ network.bssid }}">{{ icons.copy() }} Copy BSSID</button>
+    </div>
+  </div>
+  <div class="signal-gauge {{ network.signal_class }}">
+    <div class="gauge-visual">
+      <div class="gauge-ring"></div>
+      <span class="gauge-value">{{ network.signal }}<small>%</small></span>
+    </div>
+    <span class="gauge-label">Signal strength</span>
+  </div>
 </section>
 
-<section class="card"><h3>⚡ WPS Attack</h3><p class="small">Hanya untuk audit jaringan milik Anda atau yang telah diizinkan. Butuh <b>reaver</b> / <b>bully</b> terinstal dan adaptor dalam monitor mode.</p>
-<form method="post" action="/attack/wps/pixie-dust" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <button type="submit" onclick="return confirm('Jalankan WPS Pixie Dust pada {{ network.ssid }}?')">Pixie Dust</button>
-</form>
-<form method="post" action="/attack/wps/pin-brute" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <button type="submit" onclick="return confirm('Jalankan WPS Pin Brute pada {{ network.ssid }}?')">Pin Brute</button>
-</form>
-<form method="post" action="/attack/wps/common-pins" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <button type="submit" onclick="return confirm('Coba PIN WPS umum pada {{ network.ssid }}?')">Common Pins</button>
-</form>
-<form method="post" action="/attack/wps/custom-pin" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <label>Custom PIN: <input type="text" name="pin" pattern="[0-9]{8}" maxlength="8" title="8 digit PIN"></label>
-  <button type="submit" onclick="return confirm('Serang dengan PIN custom pada {{ network.ssid }}?')">Custom Pin</button>
-</form>
-</section>
+<div class="info-grid reveal">
+  <div class="info-tile"><span>Security</span><strong>{{ network.security_label }}</strong></div>
+  <div class="info-tile"><span>Channel</span><strong>{{ network.channel }}</strong></div>
+  <div class="info-tile"><span>Frequency</span><strong>{{ network.freq }} <small>MHz</small></strong></div>
+  <div class="info-tile"><span>Band</span><strong>{{ network.band }}</strong></div>
+</div>
 
-<section class="card"><h3>🔑 WPA/WPA2/WPA3 Attack</h3><p class="small">Butuh monitor mode dan file capture yang valid. Tool: <b>aircrack-ng</b>, <b>aireplay-ng</b>, <b>airodump-ng</b>, <b>tshark</b>.</p>
-<form method="post" action="/attack/wpa/pmk-capture" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <button type="submit" onclick="return confirm('Mulai PMK Capture?')">PMK Capture</button>
-</form>
-<form method="post" action="/attack/wpa/hs-capture" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <button type="submit" onclick="return confirm('Mulai Handshake Capture?')">HS Capture</button>
-</form>
-<form method="post" action="/attack/wpa/deauth" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <button type="submit" onclick="return confirm('Kirim Deauth ke {{ network.ssid }}?')">Deauth</button>
-</form>
-<form method="post" action="/attack/wpa/psk-brute" style="display:inline-block;margin-right:8px;">
-  <input type="hidden" name="iface" value="{{ iface }}">
-  <input type="hidden" name="bssid" value="{{ network.bssid }}">
-  <label>Wordlist: <input type="text" name="wordlist" placeholder="/path/to/wordlist.txt"></label>
-  <label>Capture: <input type="text" name="capture" placeholder="/path/to/capture.cap"></label>
-  <button type="submit" onclick="return confirm('Mulai PSK Brute?')">PSK Brute</button>
-</form>
-</section>
-<p><a class="btn secondary" href="/">← Kembali ke Dashboard</a></p>
+<div class="detail-layout">
+  <div class="detail-column">
+
+    <section class="panel reveal">
+      <div class="panel-head">
+        <div class="panel-icon amber">{{ icons.bolt() }}</div>
+        <div>
+          <h2>WPS audit</h2>
+          <p>Uji konfigurasi WPS pada target. Memerlukan adaptor monitor mode dan reaver/bully.</p>
+        </div>
+        <span class="badge amber head-badge">WPS</span>
+      </div>
+      <div class="panel-body">
+        <div class="tool-inline">
+          <span class="tool-chip {{ 'ok' if tool_status['reaver'] else 'bad' }}">reaver</span>
+          <span class="tool-chip {{ 'ok' if tool_status['bully'] else 'bad' }}">bully</span>
+        </div>
+        {% if not tool_status['reaver'] %}
+          <div class="notice warn">
+            <span>reaver belum terpasang. Modul tetap bisa dijalankan, tetapi terminal akan melaporkan perintah tidak ditemukan. <a href="{{ url_for('index') }}#tools">Install dari toolkit</a>.</span>
+          </div>
+        {% endif %}
+
+        <div class="module-list">
+          <form class="module" method="post" action="{{ url_for('attack_wps_pixie') }}"
+                data-confirm="Pixie Dust akan mencoba memulihkan PIN WPS target. Jalankan hanya pada jaringan yang Anda miliki atau punya izin."
+                data-confirm-title="WPS Pixie Dust"
+                data-risk="high"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="reaver -i {{ iface }} -b {{ network.bssid }} -K 1 -vv">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon amber">{{ icons.bolt() }}</div>
+            <div class="module-body">
+              <div class="module-title">Pixie Dust <span class="badge green">FAST</span></div>
+              <p class="module-desc">Coba pemulihan PIN WPS melalui kerentanan pixie dust (<code>reaver -K 1</code>).</p>
+            </div>
+            <button class="btn small primary" type="submit">Run</button>
+          </form>
+
+          <form class="module" method="post" action="{{ url_for('attack_wps_pin_brute') }}"
+                data-confirm="Pin Brute akan mencoba menebak PIN WPS secara berurutan. Proses ini bisa memakan waktu lama."
+                data-confirm-title="WPS Pin Brute"
+                data-risk="high"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="reaver -i {{ iface }} -b {{ network.bssid }} -vv">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon amber">{{ icons.radio() }}</div>
+            <div class="module-body">
+              <div class="module-title">Pin Brute <span class="badge amber">SLOW</span></div>
+              <p class="module-desc">Iterasi PIN WPS standar dengan reaver. Gunakan hanya bila scope audit mencakup WPS.</p>
+            </div>
+            <button class="btn small primary" type="submit">Run</button>
+          </form>
+
+          <form class="module" method="post" action="{{ url_for('attack_wps_common_pins') }}"
+                data-confirm="Lima PIN WPS umum akan dicoba satu per satu pada target."
+                data-confirm-title="WPS Common Pins"
+                data-risk="high"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="reaver -i {{ iface }} -b {{ network.bssid }} -p [common-pin] -vv">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon amber">{{ icons.key() }}</div>
+            <div class="module-body">
+              <div class="module-title">Common Pins <span class="badge cyan">QUICK</span></div>
+              <p class="module-desc">Coba 5 PIN default yang umum ditemukan pada perangkat WPS.</p>
+            </div>
+            <button class="btn small ghost" type="submit">Run</button>
+          </form>
+
+          <form class="module" method="post" action="{{ url_for('attack_wps_custom_pin') }}"
+                data-confirm="PIN custom akan dikirim ke target melalui reaver."
+                data-confirm-title="WPS Custom PIN"
+                data-risk="high"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="reaver -i {{ iface }} -b {{ network.bssid }} -p [pin] -vv">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon amber">{{ icons.key() }}</div>
+            <div class="module-body">
+              <div class="module-title">Custom PIN</div>
+              <p class="module-desc">Uji PIN WPS spesifik jika Anda sudah memiliki kandidat dari sumber yang sah.</p>
+              <div class="module-fields" style="grid-template-columns:1fr">
+                <div class="field">
+                  <label for="wps-pin">8 digit PIN</label>
+                  <input id="wps-pin" type="text" name="pin" inputmode="numeric" pattern="[0-9]{8}" maxlength="8" placeholder="12345670" required>
+                </div>
+              </div>
+            </div>
+            <button class="btn small ghost" type="submit">Run</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel reveal">
+      <div class="panel-head">
+        <div class="panel-icon red">{{ icons.lock() }}</div>
+        <div>
+          <h2>WPA / WPA2 audit</h2>
+          <p>Capture handshake, deauth terkontrol, dan uji passphrase dengan wordlist lokal.</p>
+        </div>
+        <span class="badge red head-badge">WPA</span>
+      </div>
+      <div class="panel-body">
+        <div class="tool-inline">
+          <span class="tool-chip {{ 'ok' if tool_status['airodump-ng'] else 'bad' }}">airodump-ng</span>
+          <span class="tool-chip {{ 'ok' if tool_status['aireplay-ng'] else 'bad' }}">aireplay-ng</span>
+          <span class="tool-chip {{ 'ok' if tool_status['aircrack-ng'] else 'bad' }}">aircrack-ng</span>
+          <span class="tool-chip {{ 'ok' if tool_status['tshark'] else 'bad' }}">tshark</span>
+        </div>
+
+        <div class="module-list">
+          <form class="module" method="post" action="{{ url_for('attack_wpa_pmk') }}"
+                data-confirm="PMK capture akan merekam trafik WPA selama 30 detik ke /tmp/pmk_capture.pcap."
+                data-confirm-title="WPA PMK Capture"
+                data-risk="medium"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="tshark -i {{ iface }} -Y wlan.rsna -a duration:30 -w /tmp/pmk_capture.pcap">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon">{{ icons.activity() }}</div>
+            <div class="module-body">
+              <div class="module-title">PMK Capture <span class="badge cyan">30 SEC</span></div>
+              <p class="module-desc">Rekam trafik RSNA dengan tshark untuk analisis PMK/handshake.</p>
+            </div>
+            <button class="btn small primary" type="submit">Run</button>
+          </form>
+
+          <form class="module" method="post" action="{{ url_for('attack_wpa_hs') }}"
+                data-confirm="Handshake capture akan menjalankan airodump-ng dan berhenti otomatis setelah 60 detik."
+                data-confirm-title="WPA Handshake Capture"
+                data-risk="medium"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="airodump-ng --bssid {{ network.bssid }} -w /tmp/hs_capture {{ iface }}">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon">{{ icons.download() }}</div>
+            <div class="module-body">
+              <div class="module-title">Handshake Capture <span class="badge cyan">60 SEC</span></div>
+              <p class="module-desc">Tangkap handshake WPA ke <code>/tmp/hs_capture</code> untuk diuji.</p>
+            </div>
+            <button class="btn small primary" type="submit">Run</button>
+          </form>
+
+          <form class="module" method="post" action="{{ url_for('attack_wpa_deauth') }}"
+                data-confirm="Deauth akan mengirim 10 frame deauthentication ke target. Tindakan ini dapat mengganggu klien yang terhubung."
+                data-confirm-title="WPA Deauth"
+                data-risk="high"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="aireplay-ng --deauth 10 -a {{ network.bssid }} {{ iface }}">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon red">{{ icons.alert() }}</div>
+            <div class="module-body">
+              <div class="module-title">Deauth <span class="badge red">INTRUSIVE</span></div>
+              <p class="module-desc">Kirim 10 frame deauth terkontrol. Dapat memutus koneksi klien sementara.</p>
+            </div>
+            <button class="btn small danger" type="submit">Run</button>
+          </form>
+
+          <form class="module module-stacked" method="post" action="{{ url_for('attack_wpa_psk_brute') }}"
+                data-confirm="PSK Brute akan menguji wordlist terhadap file capture. Proses dapat berjalan sangat lama dan menggunakan CPU tinggi."
+                data-confirm-title="WPA PSK Brute Force"
+                data-risk="high"
+                data-target="{{ network.ssid }} · {{ network.bssid }}"
+                data-command="aircrack-ng -b {{ network.bssid }} -w [wordlist] [capture]">
+            <input type="hidden" name="iface" value="{{ iface }}">
+            <input type="hidden" name="bssid" value="{{ network.bssid }}">
+            <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <div class="module-icon red">{{ icons.key() }}</div>
+            <div class="module-body">
+              <div class="module-title">PSK Brute Force <span class="badge red">HEAVY</span></div>
+              <p class="module-desc">Uji passphrase dari wordlist lokal terhadap capture handshake yang valid.</p>
+              <div class="module-fields">
+                <div class="field">
+                  <label for="wordlist">Wordlist</label>
+                  <input id="wordlist" type="text" name="wordlist" list="wordlist-options" placeholder="/usr/share/wordlists/rockyou.txt" required>
+                  <datalist id="wordlist-options">
+                    <option value="/usr/share/wordlists/rockyou.txt">
+                    <option value="/usr/share/wordlists/fasttrack.txt">
+                  </datalist>
+                </div>
+                <div class="field">
+                  <label for="capture-file">Capture file</label>
+                  <input id="capture-file" type="text" name="capture" list="capture-options" placeholder="/path/to/handshake.cap" required>
+                  <datalist id="capture-options">
+                    {% for f in capture_files %}<option value="captures/{{ f }}">{% endfor %}
+                    <option value="/tmp/hs_capture-01.cap">
+                  </datalist>
+                </div>
+              </div>
+            </div>
+            <button class="btn small danger" type="submit">Run</button>
+          </form>
+        </div>
+
+        <div class="notice warn" style="margin:14px 0 0">
+          Capture dan deauth memerlukan monitor mode. Pastikan interface berada pada mode yang tepat sebelum menjalankan modul.
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <aside class="side-stack">
+    <section class="panel reveal">
+      <div class="panel-head">
+        <div class="panel-icon">{{ icons.radar() }}</div>
+        <div>
+          <h2>Target summary</h2>
+          <p>Snapshot data scan terbaru.</p>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="side-list">
+          <div><span>SSID</span><strong>{{ network.ssid }}</strong></div>
+          <div><span>BSSID</span><strong>{{ network.bssid }}</strong></div>
+          <div><span>Interface</span><strong>{{ iface }}</strong></div>
+          <div><span>Security</span><strong>{{ network.security_label }}</strong></div>
+          <div><span>Band / Ch</span><strong>{{ network.band }} · {{ network.channel }}</strong></div>
+        </div>
+        <div class="mini-signal">
+          <div class="signal {{ network.signal_class }}">
+            <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span class="signal-val">Signal</span>
+          </div>
+          <span>{{ network.signal }}%</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel reveal">
+      <div class="panel-head">
+        <div class="panel-icon green">{{ icons.terminal() }}</div>
+        <div>
+          <h2>Live terminal</h2>
+          <p>Output proses real-time.</p>
+        </div>
+      </div>
+      <div class="panel-body">
+        <p class="small" style="margin-top:0">Setiap modul membuka terminal live dengan stream output, exit code, copy, download log, dan tombol stop.</p>
+        <div class="terminal-preview" aria-hidden="true">
+          <span class="tp-dim">┌──(stryker㉿kali)-[~]</span><br>
+          <span style="color:var(--cyan)">└─$</span> reaver -i {{ iface }} -b {{ network.bssid }}<br>
+          <span class="tp-cursor"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel risk-panel reveal">
+      <div class="panel-head">
+        <div class="panel-icon amber">{{ icons.alert() }}</div>
+        <div>
+          <h2>Rules of engagement</h2>
+          <p>Sebelum menjalankan modul.</p>
+        </div>
+      </div>
+      <div class="panel-body">
+        <ul class="risk-list">
+          <li>Pastikan target milik Anda atau ada izin tertulis.</li>
+          <li>Deauth dapat mengganggu klien lain.</li>
+          <li>Brute force bisa berjalan lama dan membebani CPU.</li>
+          <li>Semua output tersimpan di sesi terminal lokal.</li>
+        </ul>
+      </div>
+    </section>
+  </aside>
+</div>
+
 {% endblock %}

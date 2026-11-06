@@ -1,3 +1,70 @@
-{% extends "base.html" %}{% block content %}
-<section class="hero"><div class="eyebrow">Capture inspection</div><h2>Capture analyzer</h2><p>Metadata file capture untuk membantu audit dan troubleshooting. Ini bukan validasi otomatis atas keberhasilan handshake.</p></section>
-<section class="card"><div class="grid"><div><div class="small">FILE</div><h3>{{ result.file }}</h3></div><div><div class="small">SIZE</div><div class="stat">{{ (result.size / 1024)|round(1) }} KB</div></div><div><div class="small">FRAME COUNT</div><div class="stat">{{ result.frames }}</div></div><div><div class="small">STATUS</div><div class="tag">Metadata inspected</div></div></div><p class="muted">{{ result.summary }}</p><h3>Diagnostic output</h3><div class="mono">{{ result.details }}</div><p class="actions"><a class="btn secondary" href="/">← Dashboard</a></p></section>{% endblock %}
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% block title %}Capture analyzer · STRYKER{% endblock %}
+{% block content %}
+
+<nav class="breadcrumb reveal">
+  <a href="{{ url_for('index') }}">Dashboard</a><span>/</span><span>Capture analyzer</span>
+</nav>
+
+<div class="page-head reveal">
+  <div>
+    <span class="eyebrow"><i class="pulse-dot"></i> Capture inspection</span>
+    <h1 class="page-title">Capture analyzer</h1>
+    <p class="page-sub">Metadata dan diagnostik file capture untuk audit serta troubleshooting.</p>
+  </div>
+  <div class="page-actions">
+    <a class="btn ghost small" href="{{ url_for('index') }}">{{ icons.arrow() }} Dashboard</a>
+  </div>
+</div>
+
+<div class="stat-grid reveal">
+  <div class="stat-card">
+    <span class="stat-icon violet">{{ icons.file() }}</span>
+    <div style="min-width:0">
+      <span class="stat-label">File</span>
+      <span class="stat-value" style="font-size:14px" title="{{ result.file }}">{{ result.file }}</span>
+    </div>
+  </div>
+  <div class="stat-card">
+    <span class="stat-icon">{{ icons.database() }}</span>
+    <div>
+      <span class="stat-label">Size</span>
+      <span class="stat-value">{{ (result.size / 1024)|round(1) }} <small class="muted" style="font-size:12px">KB</small></span>
+    </div>
+  </div>
+  <div class="stat-card">
+    <span class="stat-icon green">{{ icons.activity() }}</span>
+    <div>
+      <span class="stat-label">Frame count</span>
+      <span class="stat-value green">{{ result.frames }}</span>
+    </div>
+  </div>
+  <div class="stat-card">
+    <span class="stat-icon amber">{{ icons.shield() }}</span>
+    <div>
+      <span class="stat-label">Status</span>
+      <span class="stat-value cyan" style="font-size:16px">INSPECTED</span>
+    </div>
+  </div>
+</div>
+
+<section class="panel reveal">
+  <div class="panel-head">
+    <div class="panel-icon green">{{ icons.terminal() }}</div>
+    <div>
+      <h2>Diagnostic output</h2>
+      <p>{{ result.summary }}</p>
+    </div>
+    <button type="button" class="btn ghost small head-badge" data-copy-target="diag-output">{{ icons.copy() }} Copy</button>
+  </div>
+  <div class="panel-body">
+    <div class="static-terminal">
+      <div class="static-term-bar">capinfos / tshark · {{ result.file }}</div>
+      <pre id="diag-output">{{ result.details }}</pre>
+    </div>
+    <p class="small" style="margin:12px 0 0">Hasil ini adalah metadata/diagnostik dasar, bukan jaminan handshake lengkap atau password dapat ditemukan.</p>
+  </div>
+</section>
+
+{% endblock %}

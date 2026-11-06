@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% block title %}{{ job.label }} · Live Terminal · STRYKER{% endblock %}
+{% block content %}
+
+<nav class="breadcrumb reveal">
+  <a href="{{ url_for('index') }}">Dashboard</a><span>/</span><span>Live terminal</span>
+</nav>
+
+<div class="page-head reveal">
+  <div>
+    <span class="eyebrow"><i class="pulse-dot"></i> Process stream</span>
+    <h1 class="page-title">{{ job.label }}</h1>
+    <p class="page-sub">Session <b class="mono">{{ job.id }}</b> · dimulai {{ job.started_at.strftime('%Y-%m-%d %H:%M:%S') }}</p>
+  </div>
+  <div class="page-actions">
+    <a class="btn ghost small" href="{{ url_for('index') }}">{{ icons.arrow() }} Dashboard</a>
+  </div>
+</div>
+
+<div class="terminal-meta-grid reveal">
+  <div class="meta-tile">
+    <span>Target</span>
+    <strong title="{{ job.target }}">{{ job.target or "—" }}</strong>
+  </div>
+  <div class="meta-tile">
+    <span>Status</span>
+    <strong id="meta-status" class="status-text running">RUNNING</strong>
+  </div>
+  <div class="meta-tile">
+    <span>Exit code</span>
+    <strong id="meta-rc" class="mono">—</strong>
+  </div>
+  <div class="meta-tile">
+    <span>Elapsed</span>
+    <strong id="meta-elapsed" class="mono">0.0s</strong>
+  </div>
+</div>
+
+<section class="terminal-shell reveal" id="terminal-shell" data-job="{{ job.id }}">
+  <div class="terminal-bar">
+    <div class="term-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+    <div class="term-title">stryker@kali: ~/wireless/{{ job.id }}</div>
+    <div class="term-meta">
+      <span class="term-status running" id="term-status">RUNNING</span>
+    </div>
+  </div>
+  <div class="terminal-body" id="terminal-output" role="log" aria-live="polite" aria-label="Output terminal">
+    <div class="term-line term-banner">STRYKER // WIRELESS AUDIT CONSOLE</div>
+    <div class="term-line term-banner-dim">session {{ job.id }} · {{ job.label }}{% if job.target %} · {{ job.target }}{% endif %}</div>
+    <div class="term-line term-banner-dim">────────────────────────────────────────</div>
+    <div class="term-line term-banner-dim" id="stream-start">[system] menunggu output proses…</div>
+    <div class="term-cursor" id="term-cursor" aria-hidden="true"></div>
+  </div>
+  <div class="terminal-footer">
+    <span class="term-command" title="{{ job.command_preview }}">{{ job.command_preview }}</span>
+    <div class="term-actions">
+      <button type="button" class="term-btn danger" id="term-stop">Stop</button>
+      <button type="button" class="term-btn" id="term-copy">Copy</button>
+      <button type="button" class="term-btn" id="term-download">Download</button>
+      <button type="button" class="term-btn active" id="term-autoscroll">Auto-scroll</button>
+    </div>
+  </div>
+</section>
+
+<div class="terminal-hint reveal">
+  <span>Streaming real-time dari proses lokal. Output tetap tersedia sampai sesi kedaluwarsa.</span>
+  <span>Tekan <kbd>Esc</kbd> untuk kembali.</span>
+</div>
+<noscript>
+  <div class="notice warn">JavaScript diperlukan untuk menampilkan stream terminal. Aktifkan JavaScript lalu muat ulang halaman.</div>
+</noscript>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/terminal.js') }}" defer></script>
+{% endblock %}

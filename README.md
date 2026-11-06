@@ -5,6 +5,9 @@ Dashboard lokal bergaya toolkit audit Wi-Fi. Ini adalah implementasi mandiri, bu
 ## Fitur
 - Menampilkan interface Wi-Fi yang dilaporkan `iw`.
 - Pemindaian jaringan sekitar melalui `nmcli`/NetworkManager (scan standar).
+- Tabel hasil scan dengan pencarian, filter keamanan, dan sorting sinyal.
+- Halaman detail per SSID: profil target, status tool, dan modul audit WPS/WPA.
+- **Live terminal** untuk setiap proses (WPS, capture, deauth, PSK brute, instalasi tool) dengan stream output, stop, copy, dan download log.
 - Status ketersediaan alat audit.
 - Analisis metadata file `.cap`, `.pcap`, dan `.pcapng` yang Anda tempatkan di `captures/`.
 - Dashboard hanya bind ke `127.0.0.1`.
@@ -27,7 +30,10 @@ Buka `http://127.0.0.1:5055` pada browser di komputer Kali yang sama.
 3. Jika menggunakan adaptor USB, pastikan chipset dan driver Linux mendukungnya.
 4. Pilih interface pada dashboard lalu klik **Scan Wi-Fi**.
 
-Pemindaian standar memakai NetworkManager. Tidak memaksa monitor mode, tidak mengirim deauthentication, tidak menginjeksi frame, tidak mencoba PIN WPS, dan tidak melakukan cracking kata sandi.
+Pemindaian standar memakai NetworkManager. Modul audit WPS/WPA tersedia di halaman detail SSID dan hanya berjalan setelah konfirmasi eksplisit. Setiap modul membuka terminal live; hentikan proses dengan tombol **Stop** bila diperlukan.
+
+## Live terminal
+Semua proses panjang dijalankan di background dan di-stream ke halaman `/terminal/<session>`. Output dapat di-copy atau diunduh sebagai file `.log`. Sesi tetap tersedia selama server berjalan (kedaluwarsa setelah sekitar 2 jam).
 
 ## Analisis capture
 Salin file capture dari audit yang sah ke folder `captures/`, lalu muat ulang dashboard. Pilih file dan klik **Analyze capture**. Hasilnya adalah metadata/diagnostik dasar, bukan jaminan bahwa suatu handshake lengkap atau password dapat ditemukan.

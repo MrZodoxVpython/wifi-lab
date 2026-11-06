@@ -1,6 +1,119 @@
-{% extends "base.html" %}{% block content %}
-<section class="hero"><div class="eyebrow">Passive/standard discovery</div><h2>Hasil pemindaian Wi-Fi</h2><p>Interface: <b>{{ iface }}</b> · {{ now }}. Data berasal dari NetworkManager; jaringan tersembunyi mungkin tidak menampilkan SSID.</p></section>
-<section class="card"><div class="actions"><a class="btn secondary" href="/">← Dashboard</a></div>
-{% if error %}<div class="notice error">{{ error }}</div>{% endif %}
-{% if rows %}<div class="tablewrap"><table><thead><tr><th>SSID</th><th>BSSID</th><th>Channel</th><th>Frequency</th><th>Signal</th><th>Security</th></tr></thead><tbody>{% for r in rows %}<tr><td>{% if r.inuse %}● {% endif %}<a href="/network/{{ iface }}/{{ r.bssid }}"><b>{{ r.ssid }}</b></a></td><td>{{ r.bssid }}</td><td>{{ r.channel }}</td><td>{{ r.freq }} MHz</td><td>{{ r.signal }}%</td><td>{{ r.security }}</td></tr>{% endfor %}</tbody></table></div><p class="small">{{ rows|length }} entri yang dilaporkan NetworkManager.</p>{% elif not error %}<div class="notice">Tidak ada jaringan yang dikembalikan. Pastikan radio Wi-Fi aktif dan NetworkManager berjalan.</div>{% endif %}
-</section>{% endblock %}
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% block title %}Hasil pemindaian · STRYKER{% endblock %}
+
+{% macro signal_meter(r) %}
+<div class="signal {{ r.signal_class }}">
+  <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+  <span class="signal-val">{{ r.signal }}%</span>
+</div>
+{% endmacro %}
+
+{% block content %}
+{% set total = rows|length %}
+{% set open_count = rows|rejectattr('secure')|list|length %}
+{% set best_signal = (rows|map(attribute='signal_int')|max) if rows else 0 %}
+
+<nav class="breadcrumb reveal">
+  <a href="{{ url_for('index') }}">Dashboard</a><span>/</span><span>Hasil pemindaian</span>
+</nav>
+
+<div class="page-head reveal">
+  <div>
+    <span class="eyebrow"><i class="pulse-dot"></i> Passive / standard discovery</span>
+    <h1 class="page-title">Jaringan di sekitar</h1>
+    <p class="page-sub">Interface <b class="mono">{{ iface }}</b> · {{ now }} · {{ total }} entri dari NetworkManager</p>
+  </div>
+  <form method="post" action="{{ url_for('scan') }}">
+    <input type="hidden" name="iface" value="{{ iface }}">
+    <button class="btn primary" type="submit">{{ icons.refresh() }} Scan ulang</button>
+  </form>
+</div>
+
+{% if error %}
+  <div class="notice error reveal">{{ error }}</div>
+{% endif %}
+
+{% if rows %}
+  <div class="summary-grid reveal">
+    <div class="summary-card"><span>Total jaringan</span><strong>{{ total }}</strong></div>
+    <div class="summary-card"><span>Terenkripsi</span><strong class="green">{{ total - open_count }}</strong></div>
+    <div class="summary-card"><span>Terbuka</span><strong class="amber">{{ open_count }}</strong></div>
+    <div class="summary-card"><span>Sinyal terkuat</span><strong class="cyan">{{ best_signal }}%</strong></div>
+  </div>
+
+  <section class="panel reveal">
+    <div class="panel-body">
+      <div class="filter-bar">
+        <div class="search-box">
+          {{ icons.search() }}
+          <input type="search" placeholder="Cari SSID atau BSSID…" aria-label="Cari jaringan" data-network-search>
+        </div>
+        <div class="chips" role="group" aria-label="Filter keamanan">
+          <button type="button" class="chip active" data-filter="all">Semua</button>
+          <button type="button" class="chip" data-filter="wpa3">WPA3</button>
+          <button type="button" class="chip" data-filter="wpa2">WPA2</button>
+          <button type="button" class="chip" data-filter="wpa">WPA</button>
+          <button type="button" class="chip" data-filter="wep">WEP</button>
+          <button type="button" class="chip" data-filter="open">Open</button>
+        </div>
+        <button type="button" class="btn ghost small" data-sort-signal><span>Signal ↓</span></button>
+      </div>
+
+      <div class="table-wrap">
+        <table data-network-table>
+          <thead>
+            <tr>
+              <th>SSID</th>
+              <th>BSSID</th>
+              <th>Band / Ch</th>
+              <th>Sinyal</th>
+              <th>Keamanan</th>
+              <th aria-label="Aksi"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in rows %}
+              <tr data-search="{{ r.ssid }} {{ r.bssid }} {{ r.security_label }}"
+                  data-security="{{ r.security_class }}"
+                  data-signal="{{ r.signal_int }}">
+                <td>
+                  <a class="net-link" href="{{ url_for('network_detail', iface=iface, bssid=r.bssid) }}">
+                    {% if r.inuse %}<span class="inuse-dot" title="Terhubung"></span>{% endif %}
+                    {{ r.ssid }}
+                  </a>
+                  {% if r.hidden %}<span class="badge" style="margin-left:6px">HIDDEN</span>{% endif %}
+                </td>
+                <td class="mono" style="color:var(--muted)">{{ r.bssid }}</td>
+                <td>
+                  <span class="badge">{{ r.band }}</span>
+                  <span class="mono" style="color:var(--muted-2);margin-left:5px">{{ r.channel }}</span>
+                </td>
+                <td>{{ signal_meter(r) }}</td>
+                <td><span class="sec-badge {{ r.security_class }}">{{ r.security_label }}</span></td>
+                <td class="arrow-cell">
+                  <a href="{{ url_for('network_detail', iface=iface, bssid=r.bssid) }}" aria-label="Buka detail {{ r.ssid }}">{{ icons.arrow() }}</a>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="table-foot"><b data-visible-count>{{ total }}</b> jaringan ditampilkan. Klik nama SSID untuk membuka detail dan modul audit. Tekan <kbd>/</kbd> untuk mencari.</p>
+      <div class="empty-state" data-filter-empty hidden style="margin-top:14px">
+        <strong>Tidak ada hasil</strong>
+        Coba kata kunci atau filter keamanan lain.
+      </div>
+    </div>
+  </section>
+{% elif not error %}
+  <div class="panel reveal">
+    <div class="panel-body">
+      <div class="empty-state">
+        <strong>Tidak ada jaringan yang dikembalikan</strong>
+        Pastikan radio Wi-Fi aktif dan NetworkManager berjalan.
+      </div>
+    </div>
+  </div>
+{% endif %}
+{% endblock %}

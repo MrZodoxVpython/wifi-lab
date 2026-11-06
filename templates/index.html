@@ -1,26 +1,234 @@
-{% extends "base.html" %}{% block content %}
-<section class="hero"><div class="eyebrow">Wireless security workspace</div><h2>Wi-Fi reconnaissance.<br>Tanpa keluar dari lab.</h2><p>Kelola interface, lakukan pemindaian standar jaringan sekitar, dan analisis file capture untuk audit yang sah. Fitur radio tingkat rendah bergantung pada chipset dan driver.</p></section>
-<div class="grid">
-<section class="card"><h3>📡 Interface Wi-Fi</h3><p class="muted">Ditemukan oleh `iw dev` pada {{ now }}.</p>
-{% if iface_error %}<div class="notice error">{{ iface_error }}</div>{% endif %}
-{% if ifaces %}<div class="tablewrap"><table><thead><tr><th>Interface</th><th>Type</th><th>PHY</th></tr></thead><tbody>{% for i in ifaces %}<tr><td><b>{{ i.name }}</b></td><td>{{ i.type }}</td><td>{{ i.phy or "—" }}</td></tr>{% endfor %}</tbody></table></div>
-<form method="post" action="/scan"><label for="iface">Pilih interface untuk scan standar</label><select id="iface" name="iface">{% for i in ifaces %}<option value="{{ i.name }}">{{ i.name }} · {{ i.type }}</option>{% endfor %}</select><p><button type="submit">Scan Wi-Fi →</button></p></form>
-{% else %}<div class="notice">Interface belum terdeteksi. Periksa `iw dev`, `ip link`, dan adaptor Wi-Fi.</div>{% endif %}
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% block title %}STRYKER · Wireless Audit Workspace{% endblock %}
+{% block content %}
+
+<section class="hero reveal">
+  <div class="hero-copy">
+    <span class="eyebrow"><i class="pulse-dot"></i> Wireless security workspace</span>
+    <h1>Audit Wi-Fi dengan<br><span class="gradient-text">presisi operator.</span></h1>
+    <p>Kelola interface, petakan jaringan sekitar, dan analisis capture — semuanya dari satu workspace lokal. Dirancang untuk audit yang sah, cepat, dan terukur.</p>
+    <div class="hero-actions">
+      <a class="btn primary" href="#scan">{{ icons.radar() }} Mulai pemindaian</a>
+      <a class="btn ghost" href="#captures">{{ icons.file() }} Analisis capture</a>
+    </div>
+  </div>
+  <div class="hero-visual" aria-hidden="true">
+    <div class="radar">
+      <div class="radar-grid"></div>
+      <span class="radar-ring r1"></span>
+      <span class="radar-ring r2"></span>
+      <span class="radar-ring r3"></span>
+      <div class="radar-sweep"></div>
+      <span class="blip b1"></span>
+      <span class="blip b2"></span>
+      <span class="blip b3"></span>
+      <div class="radar-center"><span>Passive<br>scan</span></div>
+    </div>
+    <span class="radar-caption">NetworkManager · signal monitor</span>
+  </div>
 </section>
-<section class="card"><h3>🧰 Tool availability</h3><p class="muted">Status utilitas pada sistem lokal. Klik <b>Install</b> untuk memasang via apt.</p>
-{% for t in tools %}
-<div class="toolrow">
-  <div><b>{{ t.name }}</b><div class="small">{{ t.description }}</div></div>
-  <span class="{{ 'ok' if t.installed else 'bad' }}">{{ "Installed" if t.installed else "Missing" }}</span>
-  {% if not t.installed %}
-    <form method="post" action="/install-tool/{{ t.apt }}" style="display:inline;margin-left:8px;">
-      <button type="submit" onclick="return confirm('Instal {{ t.name }} ({{ t.apt }}) via sudo apt-get?')">Install</button>
-    </form>
-  {% endif %}
+
+<section class="stat-grid reveal">
+  <div class="stat-card">
+    <span class="stat-icon">{{ icons.wifi() }}</span>
+    <div>
+      <span class="stat-label">Wi-Fi interfaces</span>
+      <span class="stat-value">{{ ifaces|length }}</span>
+    </div>
+  </div>
+  <div class="stat-card">
+    <span class="stat-icon green">{{ icons.tool() }}</span>
+    <div>
+      <span class="stat-label">Toolkit siap</span>
+      <span class="stat-value green">{{ installed_count }}<small class="muted">/{{ tools|length }}</small></span>
+    </div>
+  </div>
+  <div class="stat-card">
+    <span class="stat-icon violet">{{ icons.file() }}</span>
+    <div>
+      <span class="stat-label">Capture files</span>
+      <span class="stat-value">{{ capture_files|length }}</span>
+    </div>
+  </div>
+  <div class="stat-card">
+    <span class="stat-icon amber">{{ icons.shield() }}</span>
+    <div>
+      <span class="stat-label">Scan mode</span>
+      <span class="stat-value cyan" style="font-size:17px">PASSIVE</span>
+    </div>
+  </div>
+</section>
+
+<div class="grid dash">
+  <section class="panel reveal" id="scan">
+    <div class="panel-head">
+      <div class="panel-icon">{{ icons.wifi() }}</div>
+      <div>
+        <h2>Pemindaian jaringan</h2>
+        <p>Pilih interface lalu jalankan scan standar melalui NetworkManager.</p>
+      </div>
+      <span class="badge cyan head-badge">PASSIVE</span>
+    </div>
+    <div class="panel-body">
+      {% if iface_error %}
+        <div class="notice error">{{ iface_error }}</div>
+      {% endif %}
+      {% if ifaces %}
+        <form method="post" action="{{ url_for('scan') }}">
+          <div class="iface-list">
+            {% for i in ifaces %}
+              <label class="iface-option">
+                <input type="radio" name="iface" value="{{ i.name }}" {{ 'checked' if loop.first else '' }}>
+                <span class="radio" aria-hidden="true"></span>
+                <span class="iface-icon">{{ icons.wifi() }}</span>
+                <span class="iface-main">
+                  <strong>{{ i.name }}</strong>
+                  <small>{{ i.phy or "phy unknown" }} · {{ i.type }}</small>
+                </span>
+                <span class="badge">{{ i.type }}</span>
+              </label>
+            {% endfor %}
+          </div>
+          <div class="scan-actions">
+            <button class="btn primary" type="submit">{{ icons.radar() }} Scan Wi-Fi</button>
+            <span class="small">Sumber: <code>nmcli device wifi list</code></span>
+          </div>
+        </form>
+      {% else %}
+        <div class="empty-state">
+          <strong>Interface belum terdeteksi</strong>
+          Periksa <code>iw dev</code>, <code>ip link</code>, dan pastikan adaptor Wi-Fi terpasang.
+        </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="panel reveal" id="tools">
+    <div class="panel-head">
+      <div class="panel-icon green">{{ icons.tool() }}</div>
+      <div>
+        <h2>Toolkit</h2>
+        <p>Status utilitas pada sistem lokal.</p>
+      </div>
+      <span class="badge green head-badge">{{ installed_count }}/{{ tools|length }}</span>
+    </div>
+    <div class="panel-body">
+      <div class="progress"><span style="width: {{ (installed_count / (tools|length or 1) * 100)|round(0) }}%"></span></div>
+      <div class="tool-list">
+        {% for t in tools %}
+          <div class="tool-row">
+            <span class="tool-dot {{ 'ok' if t.installed else 'bad' }}"></span>
+            <div class="tool-info">
+              <div class="tool-name">{{ t.name }}</div>
+              <div class="tool-desc">{{ t.description }}</div>
+            </div>
+            {% if t.installed %}
+              <span class="tool-status ok">READY</span>
+            {% else %}
+              <form method="post" action="{{ url_for('install_tool', tool_name=t.apt) }}"
+                    data-confirm="Paket {{ t.apt }} akan dipasang secara sistem-wide melalui apt."
+                    data-confirm-title="Install {{ t.name }}"
+                    data-risk="medium"
+                    data-target="{{ t.apt }}"
+                    data-command="sudo apt-get install -y {{ t.apt }}">
+                <button class="btn small ghost" type="submit">Install</button>
+              </form>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+      <p class="small" style="margin:12px 0 0">Instalasi membutuhkan sudo. Output proses tampil di terminal live.</p>
+    </div>
+  </section>
 </div>
-{% endfor %}
-<p class="small">Butuh hak sudo. Tool akan diinstal secara sistem-wide.</p>
+
+{% if recent_jobs %}
+<section class="panel reveal" id="sessions" style="margin-top:18px">
+  <div class="panel-head">
+    <div class="panel-icon green">{{ icons.terminal() }}</div>
+    <div>
+      <h2>Recent sessions</h2>
+      <p>Terminal live dari proses yang baru dijalankan.</p>
+    </div>
+    <span class="badge green head-badge">{{ recent_jobs|length }} SESSION</span>
+  </div>
+  <div class="panel-body">
+    <div class="session-list">
+      {% for j in recent_jobs %}
+        <a class="session-row" href="{{ url_for('terminal', job_id=j.id) }}">
+          <span class="session-dot {{ j.status }}"></span>
+          <span class="session-main">
+            <strong>{{ j.label }}</strong>
+            <small>{{ j.target or "—" }} · {{ j.started }} · {{ "%.1f"|format(j.elapsed) }}s</small>
+          </span>
+          <span class="badge {{ 'green' if j.status == 'done' else ('red' if j.status == 'failed' else ('amber' if j.status in ['stopped', 'timeout'] else 'cyan')) }}">{{ j.status|upper }}</span>
+          {{ icons.arrow() }}
+        </a>
+      {% endfor %}
+    </div>
+  </div>
 </section>
-<section class="card"><h3>🗂️ Capture analyzer</h3><p class="muted">Analisis metadata dari file capture milik Anda.</p>{% if capture_files %}<form method="post" action="/analyze"><label for="capture">Pilih file capture</label><select id="capture" name="capture">{% for f in capture_files %}<option value="{{ f }}">{{ f }}</option>{% endfor %}</select><p><button type="submit">Analyze capture →</button></p></form>{% else %}<div class="notice">Belum ada file. Letakkan file .cap, .pcap, atau .pcapng di folder <code>captures/</code>, lalu muat ulang.</div>{% endif %}</section>
-<section class="card"><h3>🛡️ Scope & safety</h3><div class="toolrow"><span>Network scan</span><span class="ok">Standard scan</span></div><div class="toolrow"><span>Dashboard access</span><span class="ok">127.0.0.1</span></div><div class="toolrow"><span>Deauth / injection</span><span class="bad">Not implemented</span></div><div class="toolrow"><span>WPS PIN attack / cracking</span><span class="bad">Not implemented</span></div><p class="small">Program ini tidak mengganggu klien, mengirim frame injeksi, atau menebak password.</p></section>
-</div>{% endblock %}
+{% endif %}
+
+<div class="grid cols-2" id="captures" style="margin-top:18px">
+  <section class="panel reveal">
+    <div class="panel-head">
+      <div class="panel-icon violet">{{ icons.file() }}</div>
+      <div>
+        <h2>Capture analyzer</h2>
+        <p>Metadata dan diagnostik dari file capture milik Anda.</p>
+      </div>
+    </div>
+    <div class="panel-body">
+      {% if capture_files %}
+        <form method="post" action="{{ url_for('analyze') }}">
+          <div class="field">
+            <label for="capture">File capture</label>
+            <select id="capture" name="capture">
+              {% for f in capture_files %}<option value="{{ f }}">{{ f }}</option>{% endfor %}
+            </select>
+          </div>
+          <button class="btn primary" type="submit">{{ icons.activity() }} Analyze capture</button>
+        </form>
+        <p class="small" style="margin-top:12px">File dibaca dari folder <code>captures/</code>. Isi paket tidak diubah.</p>
+      {% else %}
+        <div class="empty-state">
+          <strong>Belum ada file capture</strong>
+          Letakkan file <code>.cap</code>, <code>.pcap</code>, atau <code>.pcapng</code> di folder <code>captures/</code>, lalu muat ulang.
+        </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="panel reveal">
+    <div class="panel-head">
+      <div class="panel-icon green">{{ icons.shield() }}</div>
+      <div>
+        <h2>Scope &amp; safety</h2>
+        <p>Batas operasi workspace ini.</p>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="check-list">
+        <div class="check-item">
+          {{ icons.check() }}
+          <div><strong>Passive-first scanning</strong><span>Pemindaian standar tanpa deauth atau frame injection.</span></div>
+        </div>
+        <div class="check-item">
+          {{ icons.check() }}
+          <div><strong>Localhost only</strong><span>Dashboard terikat ke <code>127.0.0.1</code> dan tidak terbuka ke jaringan.</span></div>
+        </div>
+        <div class="check-item">
+          {{ icons.check() }}
+          <div><strong>Operator-gated modules</strong><span>Modul audit hanya berjalan setelah konfirmasi eksplisit.</span></div>
+        </div>
+      </div>
+      <div class="notice warn" style="margin:16px 0 0">
+        Gunakan hanya pada jaringan milik Anda atau yang telah diizinkan secara tertulis.
+      </div>
+    </div>
+  </section>
+</div>
+
+{% endblock %}
