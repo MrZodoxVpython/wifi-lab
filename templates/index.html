@@ -138,7 +138,14 @@
           </div>
         {% endfor %}
       </div>
-      <p class="small" style="margin:12px 0 0">Instalasi membutuhkan sudo. Output proses tampil di terminal live.</p>
+      <p class="small" style="margin:12px 0 0">
+        Instalasi memakai helper root yang diatur oleh <code>./run.sh</code>. Output proses tampil di terminal live.
+        {% if privileges and privileges.ready %}
+          <span class="badge green">ROOT READY</span>
+        {% else %}
+          <span class="badge red">ROOT BELUM SIAP</span>
+        {% endif %}
+      </p>
     </div>
   </section>
 </div>

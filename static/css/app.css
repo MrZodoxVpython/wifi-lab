@@ -598,6 +598,16 @@ kbd {
   background: rgba(255, 194, 77, 0.07);
   margin-bottom: 14px;
 }
+.privilege-banner {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.privilege-banner code {
+  padding: 2px 7px;
+  border: 1px solid rgba(255, 194, 77, 0.35);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+}
 
 .empty-state {
   padding: 26px 22px;

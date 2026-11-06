@@ -6,7 +6,7 @@ analysis of existing capture files, and explicit audit modules that are only
 started by the operator. The dashboard binds to localhost only.
 """
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
-import subprocess, shutil, re, os, threading, uuid
+import subprocess, shutil, re, os, sys, threading, time, uuid
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import unquote
@@ -15,6 +15,134 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("WIFI_AUDIT_SECRET", "change-this-local-secret")
 CAPTURE_DIR = Path("captures")
 CAPTURE_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Privilege layer — Flask tetap berjalan sebagai user biasa. Semua tool yang
+# butuh root dijalankan lewat helper kecil yang diizinkan di sudoers.
+# ---------------------------------------------------------------------------
+HELPER_PATH = Path(os.environ.get("WIFI_LAB_HELPER", "/usr/local/sbin/wifi-lab-priv"))
+LOCAL_HELPER = Path(__file__).resolve().with_name("privileged_helper.py")
+_PRIV_CACHE = {"at": 0.0, "value": None}
+_PRIV_LOCK = threading.Lock()
+_PRIV_TTL = 5.0
+
+
+def is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _helper_prefix():
+    """Return (prefix, error). Prefix menjalankan wifi-lab-priv sebagai root."""
+    if HELPER_PATH.is_file() and os.access(HELPER_PATH, os.X_OK):
+        if is_root():
+            return [str(HELPER_PATH)], ""
+        return ["sudo", "-n", str(HELPER_PATH)], ""
+
+    # Menjalankan app langsung dengan sudo tapi helper belum dipasang:
+    # gunakan salinan lokal dari folder proyek.
+    if is_root() and LOCAL_HELPER.is_file():
+        return [sys.executable, str(LOCAL_HELPER)], ""
+
+    return None, (
+        "Akses root belum disiapkan. Jalankan ./setup_privileges.sh satu kali "
+        "(atau gunakan ./run.sh yang akan menawarkan setup otomatis)."
+    )
+
+
+def privilege_status(force=False):
+    now = time.time()
+    with _PRIV_LOCK:
+        cached = _PRIV_CACHE["value"]
+        if not force and cached and now - _PRIV_CACHE["at"] < _PRIV_TTL:
+            return cached
+
+    prefix, reason = _helper_prefix()
+    if prefix is None:
+        status = {
+            "ready": False,
+            "mode": "none",
+            "helper": str(HELPER_PATH),
+            "message": reason,
+        }
+    elif is_root():
+        status = {
+            "ready": True,
+            "mode": "root",
+            "helper": str(HELPER_PATH),
+            "message": "Aplikasi berjalan sebagai root.",
+        }
+    else:
+        rc, out, err = run_cmd(prefix + ["check"], timeout=8)
+        if rc == 0:
+            status = {
+                "ready": True,
+                "mode": "sudo",
+                "helper": str(HELPER_PATH),
+                "message": "Helper root aktif. Modul audit siap dijalankan.",
+            }
+        else:
+            detail = (err or out or "sudo menolak akses helper.").strip().splitlines()
+            hint = detail[-1] if detail else "sudo menolak akses helper."
+            status = {
+                "ready": False,
+                "mode": "sudo",
+                "helper": str(HELPER_PATH),
+                "message": (
+                    "Helper root ada tetapi belum diizinkan. Jalankan "
+                    f"./setup_privileges.sh. Detail: {hint}"
+                ),
+            }
+
+    with _PRIV_LOCK:
+        _PRIV_CACHE["at"] = time.time()
+        _PRIV_CACHE["value"] = status
+    return status
+
+
+def _priv_prefix_or_fallback():
+    prefix, _ = _helper_prefix()
+    if prefix:
+        return prefix
+    # Jangan pernah dipakai saat status belum ready; ini hanya pengaman.
+    return ["sudo", "-n", str(HELPER_PATH)]
+
+
+def privileged_command(tool, *args):
+    """Perintah tool yang butuh root (tanpa mengubah mode interface)."""
+    return _priv_prefix_or_fallback() + ["run", tool, *args]
+
+
+def monitor_command(iface, channel, tool, *args):
+    """Perintah tool yang butuh root + monitor mode otomatis pada channel target."""
+    return _priv_prefix_or_fallback() + [
+        "monitor-run",
+        iface,
+        str(channel or "-"),
+        tool,
+        *args,
+    ]
+
+
+def install_command(package):
+    return _priv_prefix_or_fallback() + ["install", package]
+
+
+def pretty_command(cmd):
+    """Tampilkan perintah logis tanpa detail sudo/helper yang membingungkan."""
+    parts = [str(part) for part in cmd]
+    for index, part in enumerate(parts):
+        name = Path(part).name
+        if name not in ("wifi-lab-priv", "privileged_helper.py"):
+            continue
+        rest = parts[index + 1:]
+        if rest and rest[0] == "monitor-run":
+            rest = rest[3:]  # buang aksi + nama interface + channel
+        elif rest and rest[0] == "run":
+            rest = rest[1:]
+        elif rest and rest[0] == "install":
+            return ["apt-get", "install", "-y", *rest[1:]]
+        return rest or parts[-1:]
+    return parts
 
 
 def run_cmd(args, timeout=15):
@@ -58,7 +186,7 @@ class Job:
 
     @property
     def command_preview(self):
-        return " ; ".join(" ".join(part) for part in self.commands)
+        return " ; ".join(" ".join(pretty_command(part)) for part in self.commands)
 
     def append(self, text):
         with self._lock:
@@ -147,7 +275,7 @@ def _run_job(job):
                 return
             if len(job.commands) > 1:
                 job.append(f"[system] langkah {index}/{len(job.commands)}")
-            job.append(f"$ {' '.join(cmd)}")
+            job.append(f"$ {' '.join(pretty_command(cmd))}")
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -160,6 +288,12 @@ def _run_job(job):
                 )
             except FileNotFoundError:
                 job.append(f"[error] perintah tidak ditemukan: {cmd[0]}")
+                if cmd[0] == "sudo" or Path(cmd[0]).name in ("wifi-lab-priv", "privileged_helper.py"):
+                    job.append("[hint] Akses root belum siap. Jalankan ./setup_privileges.sh lalu coba lagi.")
+                else:
+                    tool = pretty_command(cmd)[0] if cmd else cmd[0]
+                    pkg = TOOL_APT_MAP.get(tool, tool)
+                    job.append(f"[hint] Pasang dulu: sudo apt-get install -y {pkg} (atau lewat Toolkit di dashboard).")
                 rc = 127
                 if len(job.commands) > 1:
                     job.append("")
@@ -219,6 +353,38 @@ def start_job(label, commands, target="", timeout=180):
 def launch_job(label, commands, target="", timeout=180):
     job = start_job(label, commands, target=target, timeout=timeout)
     return redirect(url_for("terminal", job_id=job.id))
+
+
+def failed_job(label, message, target=""):
+    """Buat sesi terminal yang langsung menampilkan instruksi, bukan error sudo."""
+    job = Job(label, [], target=target)
+    for line in (message or "Terjadi kesalahan.").splitlines():
+        job.append(line)
+    job.finish(126)
+    with JOBS_LOCK:
+        JOBS[job.id] = job
+    return redirect(url_for("terminal", job_id=job.id))
+
+
+def launch_privileged(label, commands, target="", timeout=180):
+    """Jalankan job yang butuh root, atau tampilkan panduan yang jelas."""
+    status = privilege_status(force=True)
+    if not status["ready"]:
+        return failed_job(
+            label,
+            "[error] Modul ini membutuhkan akses root, tetapi helper belum siap.\n"
+            "\n"
+            "[fix] Jalankan sekali di terminal proyek:\n"
+            "       ./setup_privileges.sh\n"
+            "\n"
+            "[fix] Atau hentikan server lalu jalankan:\n"
+            "       sudo ./run.sh\n"
+            "\n"
+            f"[info] {status['message']}\n"
+            "[info] Setelah setup selesai, muat ulang halaman ini dan klik Run kembali.",
+            target=target,
+        )
+    return launch_job(label, commands, target=target, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +558,11 @@ def _target_label(ssid, bssid):
     return f"{ssid} · {bssid}" if ssid else bssid
 
 
+@app.context_processor
+def inject_runtime_status():
+    return {"privileges": privilege_status()}
+
+
 @app.route("/")
 def index():
     ifaces, err = interfaces()
@@ -470,9 +641,9 @@ def install_tool(tool_name):
         flash("Nama paket tidak valid.", "error")
         return redirect(url_for("index"))
     pkg = TOOL_APT_MAP.get(tool_name, tool_name)
-    return launch_job(
+    return launch_privileged(
         f"Install {pkg}",
-        [["sudo", "apt-get", "install", "-y", pkg]],
+        [install_command(pkg)],
         target=pkg,
         timeout=300,
     )
@@ -512,20 +683,23 @@ def _form_iface_bssid():
     iface = request.form.get("iface", "").strip()
     bssid = request.form.get("bssid", "").strip()
     ssid = request.form.get("ssid", "").strip()
+    channel = request.form.get("channel", "").strip()
+    if channel and not re.fullmatch(r"[0-9]{1,4}", channel):
+        channel = ""
     if not _validate_iface(iface) or not _validate_bssid(bssid):
-        return None, None, None, "Parameter interface atau BSSID tidak valid."
-    return iface, bssid, _target_label(ssid, bssid), ""
+        return None, None, None, None, "Parameter interface atau BSSID tidak valid."
+    return iface, bssid, channel, _target_label(ssid, bssid), ""
 
 
 @app.route("/attack/wps/pixie-dust", methods=["POST"])
 def attack_wps_pixie():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    return launch_job(
+    return launch_privileged(
         "WPS Pixie Dust",
-        [["reaver", "-i", iface, "-b", bssid, "-K", "1", "-vv"]],
+        [monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-K", "1", "-vv")],
         target=target,
         timeout=180,
     )
@@ -533,13 +707,13 @@ def attack_wps_pixie():
 
 @app.route("/attack/wps/pin-brute", methods=["POST"])
 def attack_wps_pin_brute():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    return launch_job(
+    return launch_privileged(
         "WPS Pin Brute",
-        [["reaver", "-i", iface, "-b", bssid, "-vv"]],
+        [monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-vv")],
         target=target,
         timeout=300,
     )
@@ -547,18 +721,21 @@ def attack_wps_pin_brute():
 
 @app.route("/attack/wps/common-pins", methods=["POST"])
 def attack_wps_common_pins():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
     common = ["12345670", "00005678", "12345678", "99985677", "00000000"]
-    commands = [["reaver", "-i", iface, "-b", bssid, "-p", pin, "-vv"] for pin in common]
-    return launch_job("WPS Common Pins", commands, target=target, timeout=45)
+    commands = [
+        monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-p", pin, "-vv")
+        for pin in common
+    ]
+    return launch_privileged("WPS Common Pins", commands, target=target, timeout=45)
 
 
 @app.route("/attack/wps/custom-pin", methods=["POST"])
 def attack_wps_custom_pin():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
@@ -566,9 +743,9 @@ def attack_wps_custom_pin():
     if not re.fullmatch(r"[0-9]{8}", pin):
         flash("PIN harus 8 digit angka.", "error")
         return redirect(url_for("index"))
-    return launch_job(
+    return launch_privileged(
         f"WPS Custom Pin ({pin})",
-        [["reaver", "-i", iface, "-b", bssid, "-p", pin, "-vv"]],
+        [monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-p", pin, "-vv")],
         target=target,
         timeout=120,
     )
@@ -576,13 +753,13 @@ def attack_wps_custom_pin():
 
 @app.route("/attack/wpa/pmk-capture", methods=["POST"])
 def attack_wpa_pmk():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    return launch_job(
+    return launch_privileged(
         "WPA PMK Capture",
-        [["tshark", "-i", iface, "-Y", "wlan.rsna", "-a", "duration:30", "-w", "/tmp/pmk_capture.pcap"]],
+        [monitor_command(iface, channel, "tshark", "-i", iface, "-Y", "wlan.rsna", "-a", "duration:30", "-w", str(CAPTURE_DIR.resolve() / "pmk_capture.pcap"))],
         target=target,
         timeout=60,
     )
@@ -590,13 +767,17 @@ def attack_wpa_pmk():
 
 @app.route("/attack/wpa/hs-capture", methods=["POST"])
 def attack_wpa_hs():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    return launch_job(
+    airodump_args = ["--bssid", bssid, "-w", str(CAPTURE_DIR.resolve() / "hs_capture")]
+    if channel:
+        airodump_args = ["--channel", channel, *airodump_args]
+    airodump_args.append(iface)
+    return launch_privileged(
         "WPA Handshake Capture",
-        [["airodump-ng", "--bssid", bssid, "-w", "/tmp/hs_capture", iface]],
+        [monitor_command(iface, channel, "airodump-ng", *airodump_args)],
         target=target,
         timeout=60,
     )
@@ -604,13 +785,13 @@ def attack_wpa_hs():
 
 @app.route("/attack/wpa/deauth", methods=["POST"])
 def attack_wpa_deauth():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    return launch_job(
+    return launch_privileged(
         "WPA Deauth",
-        [["aireplay-ng", "--deauth", "10", "-a", bssid, iface]],
+        [monitor_command(iface, channel, "aireplay-ng", "--deauth", "10", "-a", bssid, iface)],
         target=target,
         timeout=30,
     )
@@ -618,7 +799,7 @@ def attack_wpa_deauth():
 
 @app.route("/attack/wpa/psk-brute", methods=["POST"])
 def attack_wpa_psk_brute():
-    iface, bssid, target, err = _form_iface_bssid()
+    iface, bssid, channel, target, err = _form_iface_bssid()
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
@@ -633,9 +814,9 @@ def attack_wpa_psk_brute():
     if not Path(capture).is_file():
         flash(f"File capture tidak ditemukan: {capture}", "error")
         return redirect(url_for("index"))
-    return launch_job(
+    return launch_privileged(
         "WPA PSK Brute",
-        [["aircrack-ng", "-b", bssid, "-w", wordlist, capture]],
+        [privileged_command("aircrack-ng", "-b", bssid, "-w", wordlist, capture)],
         target=target,
         timeout=1800,
     )
@@ -676,5 +857,12 @@ def job_stop(job_id):
 
 
 if __name__ == "__main__":
+    status = privilege_status(force=True)
+    if not status["ready"]:
+        print("[STRYKER] PERINGATAN: modul audit belum mendapat akses root.")
+        print(f"[STRYKER] {status['message']}")
+        print("[STRYKER] Jalankan ./setup_privileges.sh sekali, lalu restart server.")
+    else:
+        print(f"[STRYKER] Hak akses root siap ({status['mode']}).")
     # Bind only to localhost; do not expose this admin panel to the network.
     app.run(host="127.0.0.1", port=5055, debug=False)

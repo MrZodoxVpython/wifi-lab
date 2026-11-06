@@ -36,8 +36,9 @@
 
   function classify(line) {
     if (/^\$ /.test(line)) return "cmd";
+    if (/^\[(?:priv|system|hint|info)\]/.test(line)) return "system";
+    if (/^\[fix\]/i.test(line)) return "system";
     if (/^\[error\]/i.test(line) || /not found|permission denied|operation not permitted|no such file/i.test(line)) return "error";
-    if (/^\[system\]/i.test(line)) return "system";
     if (/^\[exit\]/i.test(line)) return "exit";
     return "";
   }

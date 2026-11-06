@@ -1,0 +1,10 @@
+
+BSSID, First time seen, Last time seen, channel, Speed, Privacy, Cipher, Authentication, Power, # beacons, # IV, LAN IP, ID-length, ESSID, Key
+C4:EB:FF:27:18:98, 2026-11-06 21:54:54, 2026-11-06 22:12:55,  4, 130, WPA2, CCMP, PSK, -54,     5940,   354565,   0.  0.  0.  0,  16, KOST PUTRA CANDI, 
+
+Station MAC, First time seen, Last time seen, Power, # packets, BSSID, Probed ESSIDs
+AA:32:A5:AB:EE:E9, 2026-11-06 21:54:54, 2026-11-06 22:12:54, -56,   112255, C4:EB:FF:27:18:98,
+20:3B:69:CE:88:3D, 2026-11-06 21:54:54, 2026-11-06 22:12:54, -19,    43807, C4:EB:FF:27:18:98,KOST PUTRA CANDI
+F8:E7:A0:05:B6:DB, 2026-11-06 21:54:59, 2026-11-06 22:12:54, -76,     4563, C4:EB:FF:27:18:98,
+08:7F:98:FE:35:6F, 2026-11-06 21:55:24, 2026-11-06 22:12:55, -78,   223235, C4:EB:FF:27:18:98,KOST PUTRA CANDI
+

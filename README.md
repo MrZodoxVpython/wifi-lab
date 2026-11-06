@@ -14,8 +14,12 @@ Dashboard lokal bergaya toolkit audit Wi-Fi. Ini adalah implementasi mandiri, bu
 
 ## Instalasi
 ```bash
-chmod +x install.sh run.sh
+chmod +x install.sh run.sh setup_privileges.sh
 ./install.sh
+```
+`install.sh` juga memasang helper root sekali saja. Jika proyek sudah terpasang sebelumnya, jalankan:
+```bash
+sudo ./setup_privileges.sh
 ```
 
 ## Jalankan
@@ -23,6 +27,26 @@ chmod +x install.sh run.sh
 ./run.sh
 ```
 Buka `http://127.0.0.1:5055` pada browser di komputer Kali yang sama.
+
+`run.sh` memeriksa helper root. Jika belum ada, ia menawarkan setup otomatis (meminta password sudo satu kali). Flask tetap berjalan sebagai user biasa; hanya tool audit yang dijalankan sebagai root melalui helper dengan daftar putih.
+
+## Akses root dan monitor mode
+Modul setelah halaman detail SSID (`reaver`, `airodump-ng`, `aireplay-ng`, `tshark`, `aircrack-ng`, serta instalasi paket) membutuhkan root. Anda punya dua pilihan:
+
+1. **Cara yang disarankan** — jalankan `./run.sh`; helper root dipasang di `/usr/local/sbin/wifi-lab-priv` dan diizinkan lewat `/etc/sudoers.d/wifi-lab` (NOPASSWD, hanya untuk helper tersebut).
+2. **Mode root langsung** — `sudo ./run.sh`. Aplikasi berjalan sebagai root dan langsung dapat menjalankan semua tool.
+
+Saat modul WPS/capture/deauth dijalankan, helper otomatis:
+- melepas interface dari NetworkManager (`nmcli device set … managed no`),
+- mengubah interface ke monitor mode (`iw dev … set type monitor`),
+- menyetel channel target,
+- memverifikasi mode tersebut,
+- menjalankan tool,
+- mengembalikan interface ke managed mode setelah proses selesai/dihentikan.
+
+Hasil handshake/PMK capture ditulis ke folder `captures/` agar langsung bisa dianalisis dari dashboard.
+
+Jika adaptor tidak mendukung monitor mode, terminal menampilkan pesan yang jelas dan interface tetap dipulihkan.
 
 ## Persiapan pemindaian
 1. Periksa perangkat: `iw dev`
@@ -39,6 +63,11 @@ Semua proses panjang dijalankan di background dan di-stream ke halaman `/termina
 Salin file capture dari audit yang sah ke folder `captures/`, lalu muat ulang dashboard. Pilih file dan klik **Analyze capture**. Hasilnya adalah metadata/diagnostik dasar, bukan jaminan bahwa suatu handshake lengkap atau password dapat ditemukan.
 
 ## Troubleshooting
+- **Banner “Modul audit belum aktif”**: jalankan `sudo ./setup_privileges.sh`, lalu restart `./run.sh`.
+- **Cek helper root**: `sudo -n /usr/local/sbin/wifi-lab-priv check` harus menampilkan `wifi-lab-priv ok (uid=0)`.
+- **Sudo masih minta password**: pastikan file `/etc/sudoers.d/wifi-lab` ada dan user Anda cocok. Periksa dengan `sudo -l`.
+- **Monitor mode gagal**: cek dukungan adaptor dengan `iw list | grep -A8 "Supported interface modes"`. Jika adaptor tidak mendukung, modul capture/deauth tidak bisa dipakai.
+- **Interface tidak kembali managed**: ikuti perintah pemulihan yang dicetak di terminal, atau `sudo ip link set <iface> down; sudo iw dev <iface> set type managed; sudo ip link set <iface> up; sudo nmcli device set <iface> managed yes`.
 - Tidak ada interface: `iw dev` dan `ip link`
 - Tidak ada hasil scan: `nmcli radio wifi`, `systemctl restart NetworkManager`
 - Adapter tidak mendukung fitur monitor: cek chipset, driver, kernel dan dokumentasi vendor.

@@ -59,7 +59,7 @@
         <div class="panel-icon amber">{{ icons.bolt() }}</div>
         <div>
           <h2>WPS audit</h2>
-          <p>Uji konfigurasi WPS pada target. Memerlukan adaptor monitor mode dan reaver/bully.</p>
+          <p>Uji konfigurasi WPS pada target. Root helper dan monitor mode disiapkan otomatis.</p>
         </div>
         <span class="badge amber head-badge">WPS</span>
       </div>
@@ -84,6 +84,7 @@
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon amber">{{ icons.bolt() }}</div>
             <div class="module-body">
               <div class="module-title">Pixie Dust <span class="badge green">FAST</span></div>
@@ -101,6 +102,7 @@
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon amber">{{ icons.radio() }}</div>
             <div class="module-body">
               <div class="module-title">Pin Brute <span class="badge amber">SLOW</span></div>
@@ -118,6 +120,7 @@
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon amber">{{ icons.key() }}</div>
             <div class="module-body">
               <div class="module-title">Common Pins <span class="badge cyan">QUICK</span></div>
@@ -135,6 +138,7 @@
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon amber">{{ icons.key() }}</div>
             <div class="module-body">
               <div class="module-title">Custom PIN</div>
@@ -171,14 +175,15 @@
 
         <div class="module-list">
           <form class="module" method="post" action="{{ url_for('attack_wpa_pmk') }}"
-                data-confirm="PMK capture akan merekam trafik WPA selama 30 detik ke /tmp/pmk_capture.pcap."
+                data-confirm="PMK capture akan merekam trafik WPA selama 30 detik ke captures/pmk_capture.pcap."
                 data-confirm-title="WPA PMK Capture"
                 data-risk="medium"
                 data-target="{{ network.ssid }} · {{ network.bssid }}"
-                data-command="tshark -i {{ iface }} -Y wlan.rsna -a duration:30 -w /tmp/pmk_capture.pcap">
+                data-command="tshark -i {{ iface }} -Y wlan.rsna -a duration:30 -w captures/pmk_capture.pcap">
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon">{{ icons.activity() }}</div>
             <div class="module-body">
               <div class="module-title">PMK Capture <span class="badge cyan">30 SEC</span></div>
@@ -192,14 +197,15 @@
                 data-confirm-title="WPA Handshake Capture"
                 data-risk="medium"
                 data-target="{{ network.ssid }} · {{ network.bssid }}"
-                data-command="airodump-ng --bssid {{ network.bssid }} -w /tmp/hs_capture {{ iface }}">
+                data-command="airodump-ng --channel {{ network.channel }} --bssid {{ network.bssid }} -w captures/hs_capture {{ iface }}">
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon">{{ icons.download() }}</div>
             <div class="module-body">
               <div class="module-title">Handshake Capture <span class="badge cyan">60 SEC</span></div>
-              <p class="module-desc">Tangkap handshake WPA ke <code>/tmp/hs_capture</code> untuk diuji.</p>
+              <p class="module-desc">Tangkap handshake WPA ke <code>captures/hs_capture</code> untuk diuji.</p>
             </div>
             <button class="btn small primary" type="submit">Run</button>
           </form>
@@ -213,6 +219,7 @@
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon red">{{ icons.alert() }}</div>
             <div class="module-body">
               <div class="module-title">Deauth <span class="badge red">INTRUSIVE</span></div>
@@ -230,6 +237,7 @@
             <input type="hidden" name="iface" value="{{ iface }}">
             <input type="hidden" name="bssid" value="{{ network.bssid }}">
             <input type="hidden" name="ssid" value="{{ network.ssid }}">
+            <input type="hidden" name="channel" value="{{ network.channel }}">
             <div class="module-icon red">{{ icons.key() }}</div>
             <div class="module-body">
               <div class="module-title">PSK Brute Force <span class="badge red">HEAVY</span></div>
@@ -258,7 +266,7 @@
         </div>
 
         <div class="notice warn" style="margin:14px 0 0">
-          Capture dan deauth memerlukan monitor mode. Pastikan interface berada pada mode yang tepat sebelum menjalankan modul.
+          Monitor mode diaktifkan otomatis sebelum proses berjalan dan dikembalikan ke managed mode setelah selesai. Interface yang sedang terhubung akan terputus sementara.
         </div>
       </div>
     </section>
@@ -280,6 +288,10 @@
           <div><span>Interface</span><strong>{{ iface }}</strong></div>
           <div><span>Security</span><strong>{{ network.security_label }}</strong></div>
           <div><span>Band / Ch</span><strong>{{ network.band }} · {{ network.channel }}</strong></div>
+          <div>
+            <span>Root helper</span>
+            <strong><span class="badge {{ 'green' if privileges.ready else 'red' }}">{{ 'AKTIF' if privileges.ready else 'BELUM SIAP' }}</span></strong>
+          </div>
         </div>
         <div class="mini-signal">
           <div class="signal {{ network.signal_class }}">

@@ -37,6 +37,13 @@
 
 <main class="main">
   <div class="shell">
+    {% if privileges and not privileges.ready %}
+      <div class="notice warn privilege-banner" role="alert">
+        <strong>Modul audit belum aktif.</strong>
+        <span>{{ privileges.message }}</span>
+        <code>./setup_privileges.sh</code>
+      </div>
+    {% endif %}
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         {% for category, message in messages %}
