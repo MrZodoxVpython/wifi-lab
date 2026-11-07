@@ -1095,12 +1095,28 @@ def _credential_block(entry, source_note):
 
 
 def network_info_snapshot(iface, bssid, ssid):
-    """Kumpulkan info ISP/router. Hanya melakukan lookup bila target terhubung."""
+    """Kumpulkan info ISP/router tanpa mewajibkan koneksi ke target.
+
+    Tiga cakupan data:
+    - "target"  : perangkat terhubung ke jaringan target (BSSID/SSID sama).
+    - "active"  : terhubung ke Wi-Fi lain; data ISP/router mengikuti jaringan
+                  aktif dan diberi peringatan cakupan yang jelas.
+    - "offline" : tidak ada koneksi; brand target diambil dari OUI BSSID saja.
+    """
     bssid = (_normalize_mac(bssid) or "").upper()
+    raw_target_vendor = _oui_vendor(bssid) if bssid else ""
+    target_vendor = _detect_brand(raw_target_vendor) or raw_target_vendor
     result = {
         "ok": True,
         "connected": False,
-        "target": {"iface": iface, "ssid": ssid, "bssid": bssid},
+        "scope": "offline",
+        "target": {
+            "iface": iface,
+            "ssid": ssid,
+            "bssid": bssid,
+            "vendor": target_vendor,
+            "brand": target_vendor,
+        },
         "link": {},
         "isp": {},
         "router": {},
@@ -1117,86 +1133,105 @@ def network_info_snapshot(iface, bssid, ssid):
         # Roaming/mesh: SSID sama tetapi BSSID berbeda tetap dianggap jaringan target.
         return bool(ssid and candidate.get("ssid") == ssid)
 
+    target_link = _wifi_link(iface) if _validate_iface(iface) else {}
     active_iface = ""
-    link = _wifi_link(iface)
-    if matches_target(link):
-        active_iface = iface
+    link = {}
+    if matches_target(target_link):
+        active_iface, link = iface, target_link
+        result["scope"] = "target"
+        result["connected"] = True
     else:
-        # Cari interface lain yang mungkin terhubung ke jaringan target.
-        for candidate in interfaces()[0]:
-            name = candidate.get("name", "")
-            if name == iface or not _validate_iface(name):
-                continue
-            other = _wifi_link(name)
-            if matches_target(other):
-                active_iface = name
-                link = other
-                break
-
-    result["link"] = link
-    if not active_iface:
-        if link.get("connected"):
-            message = (
-                f"Interface {iface} sedang terhubung ke {link.get('ssid') or 'jaringan lain'} "
-                f"({link.get('bssid')}), bukan ke target {ssid or bssid}. "
-                "Sambungkan ke Wi-Fi target terlebih dahulu."
+        # Belum terhubung ke target: pakai koneksi Wi-Fi aktif mana pun supaya
+        # panel tetap menampilkan data, dengan peringatan cakupan.
+        if target_link.get("connected"):
+            active_iface, link = iface, target_link
+        else:
+            for candidate in interfaces()[0]:
+                name = candidate.get("name", "")
+                if name == iface or not _validate_iface(name):
+                    continue
+                other = _wifi_link(name)
+                if other.get("connected"):
+                    active_iface, link = name, other
+                    break
+        if active_iface:
+            result["scope"] = "active"
+            active_name = link.get("ssid") or active_iface
+            result["message"] = (
+                f"Tidak terhubung ke target {ssid or bssid}. Data ISP, IP publik, dan "
+                f"login router di bawah berasal dari jaringan aktif {active_name!r}, "
+                "bukan dari target."
+            )
+            result["warnings"].append(
+                "Agar hasil akurat untuk target, sambungkan perangkat ke Wi-Fi target. "
+                "Selama terhubung ke jaringan lain, ISP dan login yang tampil adalah milik "
+                "jaringan aktif tersebut."
             )
         else:
-            message = (
-                f"Interface {iface} tidak terhubung ke Wi-Fi mana pun. "
-                "Sambungkan ke jaringan target, lalu klik Run info lagi."
+            result["message"] = (
+                "Tidak ada koneksi Wi-Fi aktif. Brand target diambil dari OUI BSSID; "
+                "ISP dan IP login tidak dapat dideteksi tanpa koneksi."
             )
-        result["message"] = message
-        result["warnings"].append(
-            "Info ISP, router, dan login hanya bisa dideteksi saat perangkat terhubung ke jaringan target."
-        )
-        return result
 
-    result["connected"] = True
-    result["target"]["iface"] = active_iface
-    if link.get("bssid", "").upper() != bssid:
+    result["link"] = link
+    if active_iface:
+        result["target"]["iface"] = active_iface
+    if result["connected"] and link.get("bssid", "").upper() != bssid:
         result["warnings"].append(
             f"Terhubung ke SSID {link.get('ssid')!r} melalui BSSID {link.get('bssid')} "
             f"(target {bssid}). Kemungkinan roaming/mesh; info gateway tetap dari koneksi aktif."
         )
-    link["gateway"] = link.get("gateway") or _default_gateway(active_iface)
-    gateway = link.get("gateway", "")
-    if not gateway:
-        result["warnings"].append(
-            "Gateway IPv4 tidak terdeteksi. Login router tidak bisa ditentukan; "
-            "periksa konfigurasi DHCP atau koneksi IPv6-only."
-        )
-    gateway_mac = _neighbor_mac(gateway) if gateway else ""
-    vendor = _oui_vendor(gateway_mac) if gateway_mac else ""
 
-    try:
-        gateway_hostname = socket.gethostbyaddr(gateway)[0] if gateway else ""
-    except (OSError, socket.herror, socket.gaierror):
-        gateway_hostname = ""
-
-    # Lookup eksternal, UPnP, dan HTTP router berjalan paralel.
+    gateway = ""
+    gateway_mac = ""
+    vendor = ""
+    gateway_hostname = ""
     upnp = {}
     probes = []
-    isp = {"error": "Lookup tidak dijalankan."}
+    isp = {}
     isp_warnings = []
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        future_isp = pool.submit(_isp_lookup)
-        future_upnp = pool.submit(_upnp_discover)
-        future_http = pool.submit(_probe_router_http, gateway)
-        try:
-            isp, isp_warnings = future_isp.result(timeout=12)
-        except Exception as exc:  # noqa: BLE001 - jangan gagalkan seluruh panel
-            isp = {"error": f"Lookup ISP gagal: {exc}"}
-        try:
-            upnp = future_upnp.result(timeout=8)
-        except Exception as exc:  # noqa: BLE001
-            isp_warnings.append(f"UPnP discovery gagal: {exc}")
-        try:
-            probes = future_http.result(timeout=12)
-        except Exception as exc:  # noqa: BLE001
-            isp_warnings.append(f"HTTP fingerprint gagal: {exc}")
+    principal = {}
 
-    result["warnings"].extend(isp_warnings)
+    if active_iface:
+        link["gateway"] = link.get("gateway") or _default_gateway(active_iface)
+        gateway = link.get("gateway", "")
+        if not gateway:
+            result["warnings"].append(
+                "Gateway IPv4 tidak terdeteksi. Login router tidak bisa ditentukan; "
+                "periksa konfigurasi DHCP atau koneksi IPv6-only."
+            )
+        gateway_mac = _neighbor_mac(gateway) if gateway else ""
+        vendor = _oui_vendor(gateway_mac) if gateway_mac else ""
+
+        try:
+            gateway_hostname = socket.gethostbyaddr(gateway)[0] if gateway else ""
+        except (OSError, socket.herror, socket.gaierror):
+            gateway_hostname = ""
+
+        # Lookup eksternal, UPnP, dan HTTP router berjalan paralel.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            future_isp = pool.submit(_isp_lookup)
+            future_upnp = pool.submit(_upnp_discover)
+            future_http = pool.submit(_probe_router_http, gateway)
+            try:
+                isp, isp_warnings = future_isp.result(timeout=12)
+            except Exception as exc:  # noqa: BLE001 - jangan gagalkan seluruh panel
+                isp = {"error": f"Lookup ISP gagal: {exc}"}
+            try:
+                upnp = future_upnp.result(timeout=8)
+            except Exception as exc:  # noqa: BLE001
+                isp_warnings.append(f"UPnP discovery gagal: {exc}")
+            try:
+                probes = future_http.result(timeout=12)
+            except Exception as exc:  # noqa: BLE001
+                isp_warnings.append(f"HTTP fingerprint gagal: {exc}")
+        result["warnings"].extend(isp_warnings)
+    else:
+        isp = {
+            "error": "Tidak ada koneksi aktif; lookup ISP tidak dapat dijalankan. "
+                     "Brand target tetap ditampilkan dari OUI BSSID."
+        }
+
     result["isp"] = isp
 
     principal = probes[0] if probes else {}
@@ -1228,6 +1263,8 @@ def network_info_snapshot(iface, bssid, ssid):
         "mac": gateway_mac,
         "vendor_oui": oui_name,
         "brand": brand,
+        "target_brand": target_vendor,
+        "target_vendor": raw_target_vendor,
         "manufacturer": upnp.get("manufacturer", ""),
         "model": model,
         "model_number": upnp.get("modelNumber", ""),
@@ -1246,7 +1283,27 @@ def network_info_snapshot(iface, bssid, ssid):
         ],
     }
 
-    login_entry = _default_login_reference(brand, model, blob)
+    login_entry = _default_login_reference(brand or target_vendor, model, blob or target_vendor)
+    if result["scope"] == "offline":
+        login_note = (
+            "Tidak terhubung ke Wi-Fi mana pun, jadi IP dan URL login tidak tersedia. "
+            "Referensi kredensial di bawah hanya berdasarkan brand target dari OUI BSSID. "
+            "Kata sandi asli tidak dapat dibaca dari luar perangkat; pada ONT/ISP biasanya "
+            "tercetak di stiker perangkat."
+        )
+    elif result["scope"] == "active":
+        login_note = (
+            "IP dan URL login di atas adalah milik router pada jaringan aktif, bukan "
+            "router target. Kredensial adalah referensi default pabrik yang belum "
+            "diverifikasi; kata sandi asli tidak dapat dibaca dari luar perangkat."
+        )
+    else:
+        login_note = (
+            "Kata sandi router tidak dapat dibaca dari luar perangkat. Yang ditampilkan adalah "
+            "referensi default pabrik; pada ONT/ISP, kredensial asli biasanya tercetak di stiker "
+            "perangkat. Coba hanya pada router yang Anda miliki/berizin."
+        )
+
     result["login"] = {
         "ip": gateway,
         "url": admin_url,
@@ -1255,24 +1312,31 @@ def network_info_snapshot(iface, bssid, ssid):
             login_entry,
             "Referensi kredensial default pabrik — belum diverifikasi dan bisa sudah diubah.",
         ),
-        "note": (
-            "Kata sandi router tidak dapat dibaca dari luar perangkat. Yang ditampilkan adalah "
-            "referensi default pabrik; pada ONT/ISP, kredensial asli biasanya tercetak di stiker "
-            "perangkat. Coba hanya pada router yang Anda miliki/berizin."
-        ),
+        "note": login_note,
     }
 
-    if not vendor and not upnp and not probes:
+    if active_iface and not vendor and not upnp and not probes:
         result["warnings"].append(
             "Router tidak merespons fingerprint. Panel login memakai gateway default; "
             "beberapa router memblokir probe lokal."
         )
-    result["warnings"].append(
-        "Lookup ISP mengirim IP publik ke layanan pihak ketiga (ipinfo.io / ifconfig.co). "
-        "Gunakan hanya pada jaringan yang Anda berwenang audit."
-    )
+    if active_iface:
+        result["warnings"].append(
+            "Lookup ISP mengirim IP publik ke layanan pihak ketiga (ipinfo.io / ifconfig.co). "
+            "Gunakan hanya pada jaringan yang Anda berwenang audit."
+        )
+    if result["scope"] == "offline":
+        if target_vendor:
+            result["warnings"].append(
+                f"Brand target {target_vendor!r} diinferensikan dari OUI BSSID {bssid}. "
+                "Model dan IP login tidak dapat dipastikan tanpa koneksi."
+            )
+        else:
+            result["warnings"].append(
+                "OUI BSSID target tidak dikenali. Tanpa koneksi, brand dan login router "
+                "hanya bisa ditampilkan sebagai referensi generik."
+            )
     return result
-
 
 @app.route("/api/network-info")
 def network_info():

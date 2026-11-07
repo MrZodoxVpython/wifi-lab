@@ -64,7 +64,7 @@ Semua proses panjang dijalankan di background dan di-stream ke halaman `/termina
 Salin file capture dari audit yang sah ke folder `captures/`, lalu muat ulang dashboard. Pilih file dan klik **Analyze capture**. Hasilnya adalah metadata/diagnostik dasar, bukan jaminan bahwa suatu handshake lengkap atau password dapat ditemukan.
 
 ## Info ISP & Router
-Pada halaman detail SSID, panel **ISP & Router info** menjalankan deteksi hanya jika perangkat benar-benar terhubung ke jaringan target (BSSID sama, atau SSID sama saat roaming/mesh). Data yang dikumpulkan:
+Pada halaman detail SSID, panel **ISP & Router info** menjalankan deteksi tanpa harus terhubung ke jaringan target terlebih dahulu. Jika terhubung ke target, data diambil dari jaringan tersebut; jika terhubung ke jaringan lain atau tidak ada koneksi, panel tetap menampilkan informasi yang tersedia dengan peringatan cakupan. Data yang dikumpulkan:
 - ISP, ASN, IP publik, dan lokasi — lookup `ipinfo.io`, fallback ke `ifconfig.co`.
 - IP lokal, gateway, DNS, dan MAC gateway.
 - Brand/model router dari OUI MAC gateway, UPnP SSDP, serta fingerprint halaman login (judul/server/form).
@@ -74,11 +74,11 @@ Catatan:
 - Lookup ISP mengirim IP publik ke layanan pihak ketiga. Jalankan hanya pada jaringan yang Anda berwenang audit.
 - Kredensial router adalah **referensi default pabrik**, bukan hasil pembacaan password dari perangkat. Aplikasi tidak melakukan login otomatis atau brute force terhadap halaman admin.
 - Pada ONT/router ISP, kredensial asli biasanya tercetak di stiker perangkat.
-- Jika belum terhubung ke Wi-Fi target, panel menampilkan status tanpa melakukan lookup eksternal.
+- Jika belum terhubung ke Wi-Fi target, panel tetap menampilkan brand target dari OUI BSSID dan kredensial default pabrik; IP publik, ISP, gateway, dan login router hanya tersedia jika ada koneksi Wi-Fi aktif (dari jaringan target atau jaringan lain yang sedang digunakan).
 
 ## Troubleshooting
 - **Banner “Modul audit belum aktif”**: jalankan `sudo ./setup_privileges.sh`, lalu restart `./run.sh`.
-- **Info ISP menampilkan “belum terhubung”**: sambungkan komputer ke Wi-Fi target, lalu klik **Run info** lagi. Deteksi tidak dijalankan pada jaringan lain.
+- **Info ISP menampilkan data dari jaringan lain atau tidak tersedia**: hasil diikuti koneksi Wi-Fi aktif saat ini. Untuk data akurat target, sambungkan ke Wi-Fi target lalu klik **Run info** lagi.
 - **Router tidak terdeteksi**: sebagian router memblokir UPnP/probe HTTP lokal. Panel tetap menampilkan gateway dan referensi kredensial generik.
 - **Cek helper root**: `sudo -n /usr/local/sbin/wifi-lab-priv check` harus menampilkan `wifi-lab-priv ok (uid=0)`.
 - **Sudo masih minta password**: pastikan file `/etc/sudoers.d/wifi-lab` ada dan user Anda cocok. Periksa dengan `sudo -l`.

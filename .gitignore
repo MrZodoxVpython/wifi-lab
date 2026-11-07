@@ -1,3 +1,4 @@
 __pycache__/
 *.py[cod]
 .venv/
+capture_output-01.cap

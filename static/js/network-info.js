@@ -235,10 +235,6 @@
         renderError((data && data.error) || ("Server mengembalikan HTTP " + response.status + "."));
         return;
       }
-      if (!data.connected) {
-        renderNotConnected(data);
-        return;
-      }
       renderResult(data);
     } catch (err) {
       if (err && err.name === "AbortError") {
