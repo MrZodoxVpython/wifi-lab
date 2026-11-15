@@ -22,6 +22,10 @@
       <span class="sec-badge {{ network.security_class }}">{{ network.security_label }}</span>
       <span class="badge">{{ network.band }}</span>
       <span class="badge">CH {{ network.channel }}</span>
+      {% if network.wps_known %}
+        {% if network.wps %}<span class="badge amber" title="WPS aktif{% if network.wps_state %} · {{ network.wps_state }}{% endif %}{% if network.wps_locked %} · AP setup locked{% endif %}">WPS ON</span>
+        {% else %}<span class="badge">WPS OFF</span>{% endif %}
+      {% endif %}
       {% if network.inuse %}<span class="badge green">CONNECTED</span>{% endif %}
       {% if network.hidden %}<span class="badge">HIDDEN SSID</span>{% endif %}
     </div>
@@ -101,6 +105,11 @@
           <span class="tool-chip {{ 'ok' if tool_status['reaver'] else 'bad' }}">reaver</span>
           <span class="tool-chip {{ 'ok' if tool_status['bully'] else 'bad' }}">bully</span>
         </div>
+        {% if network.wps_known and not network.wps %}
+          <div class="notice warn">
+            <span>AP ini tidak mengiklankan WPS (tidak ada elemen WPS pada beacon). Modul reaver kemungkinan tidak akan menemukan target WPS.</span>
+          </div>
+        {% endif %}
         {% if not tool_status['reaver'] %}
           <div class="notice warn">
             <span>reaver belum terpasang. Modul tetap bisa dijalankan, tetapi terminal akan melaporkan perintah tidak ditemukan. <a href="{{ url_for('index') }}#tools">Install dari toolkit</a>.</span>

@@ -13,6 +13,7 @@
 {% set total = rows|length %}
 {% set open_count = rows|rejectattr('secure')|list|length %}
 {% set best_signal = (rows|map(attribute='signal_int')|max) if rows else 0 %}
+{% set wps_unknown = rows|rejectattr('wps_known')|list|length %}
 
 <nav class="breadcrumb reveal">
   <a href="{{ url_for('index') }}">Dashboard</a><span>/</span><span>Hasil pemindaian</span>
@@ -69,6 +70,7 @@
               <th>Band / Ch</th>
               <th>Sinyal</th>
               <th>Keamanan</th>
+              <th>WPS</th>
               <th aria-label="Aksi"></th>
             </tr>
           </thead>
@@ -91,6 +93,15 @@
                 </td>
                 <td>{{ signal_meter(r) }}</td>
                 <td><span class="sec-badge {{ r.security_class }}">{{ r.security_label }}</span></td>
+                <td>
+                  {% if not r.wps_known %}
+                    <span class="muted" title="Status WPS tidak tersedia. Perbarui helper root dengan sudo ./setup_privileges.sh lalu scan ulang.">—</span>
+                  {% elif r.wps %}
+                    <span class="badge amber" title="WPS aktif{% if r.wps_state %} · {{ r.wps_state }}{% endif %}{% if r.wps_locked %} · AP setup locked{% endif %}">ON</span>
+                  {% else %}
+                    <span class="badge" title="AP tidak mengiklankan WPS">OFF</span>
+                  {% endif %}
+                </td>
                 <td class="arrow-cell">
                   <a href="{{ url_for('network_detail', iface=iface, bssid=r.bssid) }}" aria-label="Buka detail {{ r.ssid }}">{{ icons.arrow() }}</a>
                 </td>
@@ -100,6 +111,9 @@
         </table>
       </div>
       <p class="table-foot"><b data-visible-count>{{ total }}</b> jaringan ditampilkan. Klik nama SSID untuk membuka detail dan modul audit. Tekan <kbd>/</kbd> untuk mencari.</p>
+      {% if wps_unknown %}
+        <p class="table-foot">Status WPS tidak tersedia untuk {{ wps_unknown }} jaringan. Perbarui helper root dengan <code>sudo ./setup_privileges.sh</code> lalu scan ulang.</p>
+      {% endif %}
       <div class="empty-state" data-filter-empty hidden style="margin-top:14px">
         <strong>Tidak ada hasil</strong>
         Coba kata kunci atau filter keamanan lain.

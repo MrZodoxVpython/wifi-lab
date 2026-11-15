@@ -56,6 +56,32 @@
     statusEl.innerHTML = html;
   }
 
+  function scopeMeta(data) {
+    var scope = data.scope || (data.connected ? "target" : "offline");
+    if (scope === "target") {
+      return {
+        scope: scope,
+        badge: '<span class="badge green">TERHUBUNG KE TARGET</span>',
+        tone: "ok",
+        message: "Info ISP dan router target berhasil dikumpulkan."
+      };
+    }
+    if (scope === "active") {
+      return {
+        scope: scope,
+        badge: '<span class="badge amber">JARINGAN AKTIF LAIN</span>',
+        tone: "warn",
+        message: "Target belum terhubung. Data ISP dan router diambil dari jaringan yang sedang aktif."
+      };
+    }
+    return {
+      scope: "offline",
+      badge: '<span class="badge amber">TIDAK ADA KONEKSI</span>',
+      tone: "warn",
+      message: "Tidak ada koneksi Wi-Fi aktif. Brand target diambil dari OUI BSSID."
+    };
+  }
+
   function renderLoading() {
     if (resultEl) {
       resultEl.hidden = true;
@@ -78,53 +104,50 @@
       "</div>";
   }
 
-  function renderNotConnected(data) {
-    setStatus(
-      '<span class="badge amber">BELUM TERHUBUNG</span> ' +
-      esc(data.message || "Perangkat belum terhubung ke Wi-Fi target."),
-      "warn"
-    );
-    if (!resultEl) return;
-    resultEl.hidden = false;
-    var link = data.link || {};
-    var rows = [
-      ["Interface", text(link.iface || (data.target || {}).iface)],
-      ["Status", link.connected ? "Terhubung ke jaringan lain" : "Tidak terhubung"],
+  function connectionRows(link) {
+    var ipv4 = (link.ipv4 || []).map(function (item) {
+      return item.address + (item.prefix != null ? "/" + item.prefix : "");
+    }).join(", ");
+    var dns = (link.dns || []).join(", ");
+    return [
+      ["SSID aktif", text(link.ssid)],
+      ["BSSID aktif", text(link.bssid)],
+      ["Interface", text(link.iface)],
+      ["IP lokal", text(ipv4)],
+      ["Gateway", text(link.gateway)],
+      ["DNS", text(dns)],
     ];
-    if (link.connected) {
-      rows.push(["SSID aktif", text(link.ssid)]);
-      rows.push(["BSSID aktif", text(link.bssid)]);
-    }
-    rows.push(["Target SSID", text((data.target || {}).ssid)]);
-    rows.push(["Target BSSID", text((data.target || {}).bssid)]);
-    resultEl.innerHTML = '<div class="netinfo-grid">' +
-      card("Koneksi saat ini", '<span class="badge amber">OFFLINE</span>', kv(rows), "wide") +
-      "</div>" +
-      '<div class="netinfo-empty"><p>Sambungkan komputer ke jaringan <b>' +
-      esc(text((data.target || {}).ssid, "target")) + "</b>, lalu klik <b>Run info</b> lagi.</p></div>" +
-      warningList(data.warnings);
   }
 
-  function renderResult(data) {
+  function renderInfo(data) {
+    var target = data.target || {};
     var link = data.link || {};
     var isp = data.isp || {};
     var router = data.router || {};
     var login = data.login || {};
     var creds = login.credentials || {};
+    var meta = scopeMeta(data);
 
-    var ipv4 = (link.ipv4 || []).map(function (item) {
-      return item.address + (item.prefix != null ? "/" + item.prefix : "");
-    }).join(", ");
-    var dns = (link.dns || []).join(", ");
+    setStatus(meta.badge + " " + esc(data.message || meta.message), meta.tone);
 
-    var connectionBody = kv([
-      ["SSID", text(link.ssid || (data.target || {}).ssid)],
-      ["BSSID", text(link.bssid || (data.target || {}).bssid)],
-      ["Interface", text(link.iface || (data.target || {}).iface)],
-      ["IP lokal", text(ipv4)],
-      ["Gateway", text(link.gateway)],
-      ["DNS", text(dns)],
+    var targetBrand = router.target_brand || target.brand || target.vendor || "";
+    var targetBody = kv([
+      ["SSID target", text(target.ssid)],
+      ["BSSID target", text(target.bssid)],
+      ["Interface target", text(target.iface)],
+      ["Brand AP (OUI)", text(targetBrand, "Tidak dikenali")],
+      ["Status", meta.scope === "target"
+        ? "Terhubung ke target"
+        : (meta.scope === "active" ? "Target tidak terhubung" : "Offline")],
     ]);
+
+    var connectionCard = link.connected
+      ? card(
+        "Koneksi aktif",
+        '<span class="badge green">ONLINE</span>',
+        kv(connectionRows(link))
+      )
+      : "";
 
     var ispBadge = isp.error
       ? '<span class="badge red">TIDAK TERSEDIA</span>'
@@ -141,7 +164,7 @@
         ["Sumber", text(isp.source)],
       ]);
 
-    var brand = router.brand || router.vendor_oui || "Tidak teridentifikasi";
+    var brand = router.brand || targetBrand || "Tidak teridentifikasi";
     var model = [router.model, router.model_number].filter(Boolean).join(" ");
     var evidence = (router.evidence || []).length
       ? '<ul class="netinfo-evidence">' + router.evidence.map(function (item) {
@@ -150,8 +173,10 @@
       : "";
     var routerBadge = router.brand
       ? '<span class="badge cyan">' + esc(router.brand) + "</span>"
-      : '<span class="badge amber">GENERIK</span>';
-    var routerBody = kv([
+      : (targetBrand
+        ? '<span class="badge amber">' + esc(targetBrand) + " (OUI)</span>"
+        : '<span class="badge amber">GENERIK</span>');
+    var routerRows = [
       ["Brand", text(brand)],
       ["Model", text(model)],
       ["Manufaktur", text(router.manufacturer)],
@@ -159,7 +184,11 @@
       ["Gateway", text(router.gateway)],
       ["MAC gateway", text(router.mac) + (router.vendor_oui ? " · " + router.vendor_oui : "")],
       ["Hostname", text(router.gateway_hostname)],
-    ]) + evidence;
+    ];
+    if (targetBrand && targetBrand !== brand) {
+      routerRows.push(["Brand target (OUI)", text(targetBrand)]);
+    }
+    var routerBody = kv(routerRows) + evidence;
 
     var adminUrl = login.url || "";
     var urlLine = adminUrl
@@ -167,7 +196,8 @@
         '<span class="netinfo-kicker">Login URL</span>' +
         '<a href="' + esc(adminUrl) + '" target="_blank" rel="noopener noreferrer">' + esc(adminUrl) + "</a>" +
         copyButton(adminUrl, "Copy URL") + "</div>"
-      : "";
+      : '<div class="netinfo-empty tight"><p>IP/URL login belum tersedia' +
+        (meta.scope === "offline" ? " karena tidak ada koneksi aktif." : ".") + "</p></div>";
 
     var usernameRow = '<div class="netinfo-cred"><span>Username</span><strong>' +
       esc(text(creds.username, "(kosong)")) + "</strong>" + copyButton(creds.username) + "</div>";
@@ -178,6 +208,12 @@
       return '<code>' + esc(pair.username || "(kosong)") + " / " +
         esc(pair.password || "(kosong)") + "</code>";
     }).join(" ");
+
+    var loginBadge = meta.scope === "target"
+      ? '<span class="badge amber">REFERENSI DEFAULT</span>'
+      : (meta.scope === "active"
+        ? '<span class="badge amber">ROUTER JARINGAN AKTIF</span>'
+        : '<span class="badge amber">TANPA IP LOGIN</span>');
 
     var loginBody = urlLine +
       '<div class="netinfo-creds">' + usernameRow + passwordRow + "</div>" +
@@ -192,21 +228,16 @@
     if (resultEl) {
       resultEl.hidden = false;
       resultEl.innerHTML = '<div class="netinfo-grid">' +
-        card("Koneksi", '<span class="badge green">TERHUBUNG</span>', connectionBody) +
+        card("Target", meta.badge, targetBody) +
+        connectionCard +
         card("ISP", ispBadge, ispBody) +
         card("Router", routerBadge, routerBody) +
-        card(
-          "Login router",
-          '<span class="badge amber">REFERENSI DEFAULT</span>',
-          loginBody,
-          "wide"
-        ) +
+        card("Login router", loginBadge, loginBody, "wide") +
         "</div>" +
         warningList(data.warnings) +
         '<p class="netinfo-stamp">Diperbarui ' + esc(text(data.generated_at)) +
         " · kredensial default belum diverifikasi</p>";
     }
-    setStatus('<span class="badge green">SELESAI</span> Info jaringan berhasil dikumpulkan.', "ok");
   }
 
   async function runInfo() {
@@ -227,7 +258,7 @@
     renderLoading();
 
     var controller = new AbortController();
-    var timer = setTimeout(function () { controller.abort(); }, 45000);
+    var timer = setTimeout(function () { controller.abort(); }, 120000);
     try {
       var response = await fetch(url, { signal: controller.signal, headers: { Accept: "application/json" } });
       var data = await response.json().catch(function () { return null; });
@@ -235,10 +266,10 @@
         renderError((data && data.error) || ("Server mengembalikan HTTP " + response.status + "."));
         return;
       }
-      renderResult(data);
+      renderInfo(data);
     } catch (err) {
       if (err && err.name === "AbortError") {
-        renderError("Permintaan melebihi 45 detik. Router atau layanan ISP mungkin tidak merespons.");
+        renderError("Permintaan melebihi 120 detik. Router atau layanan ISP mungkin tidak merespons.");
       } else {
         renderError("Tidak dapat menghubungi server: " + (err && err.message ? err.message : err));
       }

@@ -1,0 +1,2 @@
+# Python packages required by MFP WiFi Lab
+scapy>=2.5.0

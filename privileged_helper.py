@@ -7,8 +7,10 @@ putih, sehingga Flask tetap berjalan sebagai user biasa.
 
 Perintah yang didukung:
   wifi-lab-priv check
+  wifi-lab-priv scan IFACE
   wifi-lab-priv run TOOL [ARGS...]
-  wifi-lab-priv monitor-run IFACE TOOL [ARGS...]
+  wifi-lab-priv monitor-run IFACE CHANNEL|- TOOL [ARGS...]
+  wifi-lab-priv restore IFACE
   wifi-lab-priv install PACKAGE
 """
 import os
@@ -110,9 +112,39 @@ def restore_managed(iface):
     rc = sh(["iw", "dev", iface, "set", "type", "managed"], optional=True)
     sh(["ip", "link", "set", iface, "up"], optional=True)
     sh(["nmcli", "device", "set", iface, "managed", "yes"], optional=True)
-    sh(["nmcli", "device", "connect", iface], optional=True)
-    if rc == 0:
+
+    # NetworkManager kadang menyelesaikan aktivasi secara asinkron. Coba
+    # reconnect beberapa kali agar interface tidak tertinggal disconnected.
+    connected = False
+    for attempt in range(1, 7):
+        try:
+            p = subprocess.run(
+                ["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            state = (p.stdout or "") + (p.stderr or "")
+        except Exception:  # noqa: BLE001
+            state = ""
+        if any(line.startswith(f"{iface}:connected") for line in state.splitlines()):
+            connected = True
+            break
+        out(f"[priv] Menyambungkan ulang {iface} ({attempt}/6)...")
+        sh(["nmcli", "device", "connect", iface], optional=True)
+        time.sleep(2)
+
+    if rc == 0 and connected:
+        out(f"[priv] {iface} kembali ke managed mode dan tersambung.")
+        return True
+    elif rc == 0:
         out(f"[priv] {iface} kembali ke managed mode.")
+        err(
+            f"[priv] PERINGATAN: {iface} belum tersambung ke jaringan. "
+            f"Pilih jaringan di NetworkManager atau jalankan: nmcli device connect {iface}"
+        )
+        return False
     else:
         err(
             f"[priv] PERINGATAN: gagal mengembalikan {iface} ke managed mode.\n"
@@ -122,6 +154,99 @@ def restore_managed(iface):
             f"[priv]   sudo ip link set {iface} up\n"
             f"[priv]   sudo nmcli device set {iface} managed yes"
         )
+        return False
+
+
+def restore_interface(iface):
+    """Pulihkan satu interface dari monitor mode ke managed mode.
+
+    Jika interface masih memakai nama hasil airmon-ng (mis. wlan0mon) dan
+    interface aslinya (wlan0) belum ada, coba hentikan airmon-ng terlebih
+    dahulu agar nama interface kembali normal.
+    """
+    if not IFACE_RE.fullmatch(iface or ""):
+        err(f"[priv] nama interface tidak valid: {iface!r}")
+        return 2
+    if os.geteuid() != 0:
+        err("[priv] restore harus dijalankan sebagai root (via sudo).")
+        return 2
+
+    sh(["rfkill", "unblock", "wifi"], optional=True)
+    sh(["rfkill", "unblock", "all"], optional=True)
+
+    target = iface
+    base = iface[:-3] if iface.endswith("mon") else iface
+    if base != iface and not os.path.exists(f"/sys/class/net/{base}"):
+        airmon = shutil.which("airmon-ng", path=SEARCH_PATH)
+        if airmon:
+            rc = sh([airmon, "stop", iface], optional=True)
+            if rc == 0 and os.path.exists(f"/sys/class/net/{base}"):
+                target = base
+                out(f"[priv] airmon-ng mengembalikan {iface} -> {base}.")
+
+    # airmon-ng kadang berhasil me-rename walau return code-nya bukan 0.
+    if not os.path.exists(f"/sys/class/net/{target}") and os.path.exists(
+        f"/sys/class/net/{base}"
+    ):
+        target = base
+
+    if not os.path.exists(f"/sys/class/net/{target}"):
+        err(f"[priv] interface tidak ditemukan: {target}")
+        return 1
+
+    ok = restore_managed(target)
+    return 0 if ok else 1
+
+
+def scan_interface(iface):
+    """Ambil hasil scan nl80211 sebagai root dan cetak hasil mentahnya.
+
+    Memakai `iw dev IFACE scan dump` (cache kernel) dan fallback ke
+    `iw dev IFACE scan`. Dipakai aplikasi untuk membaca informasi IE
+    (mis. WPS) yang tidak diekspos NetworkManager. Mode interface tidak
+    diubah.
+    """
+    if not IFACE_RE.fullmatch(iface or ""):
+        err(f"[priv] nama interface tidak valid: {iface!r}")
+        return 2
+    if os.geteuid() != 0:
+        err("[priv] scan harus dijalankan sebagai root (via sudo).")
+        return 2
+
+    iw_path = resolve("iw")
+    if not iw_path:
+        return 127
+
+    def run_scan(args):
+        try:
+            return subprocess.run(
+                [iw_path, "dev", iface, *args],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            err(f"[priv] pemindaian iw pada {iface} melebihi 60 detik.")
+            return None
+
+    # Utamakan hasil cache kernel: nmcli baru saja melakukan scan, sehingga
+    # `scan dump` cepat dan tidak memicu scan kedua yang bisa gagal EBUSY.
+    # `-b` menampilkan IE dari probe response dan beacon sekaligus agar WPS
+    # tetap terlihat walau AP hanya mencantumkannya di salah satu frame.
+    p = run_scan(["scan", "dump", "-b"])
+    if p is None:
+        return 124
+    if p.returncode != 0 or "BSS " not in (p.stdout or ""):
+        p = run_scan(["scan", "-b"])
+        if p is None:
+            return 124
+
+    if p.stdout.strip():
+        out(p.stdout.rstrip("\n"))
+    if p.stderr.strip():
+        err(p.stderr.strip())
+    return p.returncode
 
 
 def enter_monitor(iface, channel=None):
@@ -235,7 +360,7 @@ def monitor_run(iface, channel, tool, args):
 
 def main(argv):
     if len(argv) < 2:
-        err("usage: wifi-lab-priv {check|run|monitor-run|install} ...")
+        err("usage: wifi-lab-priv {check|scan|run|monitor-run|restore|install} ...")
         return 2
 
     action = argv[1]
@@ -243,6 +368,18 @@ def main(argv):
     if action == "check":
         out(f"wifi-lab-priv ok (uid={os.geteuid()})")
         return 0
+
+    if action == "scan":
+        if len(argv) != 3:
+            err("usage: wifi-lab-priv scan IFACE")
+            return 2
+        return scan_interface(argv[2])
+
+    if action == "restore":
+        if len(argv) != 3:
+            err("usage: wifi-lab-priv restore IFACE")
+            return 2
+        return restore_interface(argv[2])
 
     if action == "run":
         if len(argv) < 3:
