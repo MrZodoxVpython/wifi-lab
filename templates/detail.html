@@ -148,7 +148,7 @@
             <div class="module-icon amber">{{ icons.radio() }}</div>
             <div class="module-body">
               <div class="module-title">Pin Brute <span class="badge amber">SLOW</span></div>
-              <p class="module-desc">Iterasi PIN WPS standar dengan reaver. Gunakan hanya bila scope audit mencakup WPS.</p>
+              <p class="module-desc">Iterasi PIN WPS standar dengan reaver. Channel awal di-refresh otomatis dan reaver tetap channel-hopping bila AP berpindah channel; jika beacon tidak terlihat dalam 90 detik proses dihentikan agar tidak menggantung.</p>
             </div>
             <button class="btn small primary" type="submit">Run</button>
           </form>

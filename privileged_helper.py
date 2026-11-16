@@ -106,7 +106,129 @@ def sh(args, optional=False, timeout=20):
     return p.returncode
 
 
+def iface_exists(name):
+    return bool(name) and os.path.exists(f"/sys/class/net/{name}")
+
+
+def monitor_name(iface):
+    """Nama interface monitor khusus, maksimal 15 karakter (IFNAMSIZ-1)."""
+    return f"{iface}mon"[:15]
+
+
+def phy_name(iface):
+    iw = resolve("iw") or "iw"
+    try:
+        p = subprocess.run(
+            [iw, "dev", iface, "info"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    for line in (p.stdout or "").splitlines():
+        text = line.strip()
+        if text.startswith("wiphy "):
+            return f"phy{text.split(None, 1)[1]}"
+    return ""
+
+
+def delete_iface(name):
+    if not iface_exists(name):
+        return
+    sh(["ip", "link", "set", name, "down"], optional=True)
+    sh(["iw", "dev", name, "del"], optional=True)
+
+
+def set_monitor_channel(mon, channel):
+    """Set channel monitor dan coba beberapa metode bila iwlwifi menolak.
+
+    iwlwifi (mis. AC 8265) kadang melaporkan sukses lewat `iw` tetapi firmware
+    tetap berada di channel asosiasi terakhir. Dedicated monitor interface
+    adalah jalur utama; fungsi ini menambahkan fallback `set freq`/iwconfig.
+    """
+    ch = str(channel)
+    ok = sh(["iw", "dev", mon, "set", "channel", ch], optional=True) == 0
+    if not ok:
+        # Beberapa driver lebih menerima frekuensi eksplisit.
+        try:
+            number = int(ch)
+        except ValueError:
+            number = 0
+        freq = 0
+        if 1 <= number <= 13:
+            freq = 2407 + number * 5
+        elif number == 14:
+            freq = 2484
+        elif 15 <= number <= 200:
+            freq = (number + 1000) * 5
+        if freq:
+            ok = sh(["iw", "dev", mon, "set", "freq", str(freq)], optional=True) == 0
+    if not ok:
+        ok = sh(["iwconfig", mon, "channel", ch], optional=True) == 0
+    if ok:
+        out(f"[priv] Channel {ch} disetel pada {mon}.")
+    else:
+        err(f"[priv] Peringatan: gagal menyetel channel {ch} pada {mon}.")
+    return ok
+
+
+def wait_disconnected(iface, attempts=10):
+    """Tunggu sampai station benar-benar lepas dari AP sebelum ganti mode."""
+    iw = resolve("iw") or "iw"
+    for _ in range(attempts):
+        try:
+            p = subprocess.run(
+                [iw, "dev", iface, "link"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            info = (p.stdout or "") + (p.stderr or "")
+        except Exception:  # noqa: BLE001
+            info = ""
+        if "Not connected" in info or not info.strip():
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def create_monitor_iface(iface, channel=None):
+    """Buat monitor interface terpisah; return namanya atau "" bila gagal."""
+    mon = monitor_name(iface)
+    delete_iface(mon)
+
+    # Managed interface harus down agar slot channel-nya lepas dari firmware.
+    sh(["ip", "link", "set", iface, "down"], optional=True)
+    rc = sh(
+        ["iw", "dev", iface, "interface", "add", mon, "type", "monitor"],
+        optional=True,
+    )
+    if rc != 0:
+        phy = phy_name(iface)
+        if phy:
+            rc = sh(
+                ["iw", "phy", phy, "interface", "add", mon, "type", "monitor"],
+                optional=True,
+            )
+    if rc != 0:
+        delete_iface(mon)
+        return ""
+
+    sh(["ip", "link", "set", mon, "up"], optional=True)
+    if channel:
+        set_monitor_channel(mon, channel)
+    return mon
+
+
 def restore_managed(iface):
+    # Hapus monitor interface pasangan (mis. wlan0mon) sebelum restore.
+    mon = monitor_name(iface)
+    if mon != iface:
+        delete_iface(mon)
+
     out(f"[priv] Mengembalikan {iface} ke managed mode...")
     sh(["ip", "link", "set", iface, "down"], optional=True)
     rc = sh(["iw", "dev", iface, "set", "type", "managed"], optional=True)
@@ -249,56 +371,113 @@ def scan_interface(iface):
     return p.returncode
 
 
-def enter_monitor(iface, channel=None):
-    out(f"[priv] Menyiapkan monitor mode pada {iface}...")
-    sh(["rfkill", "unblock", "wifi"], optional=True)
-    # NetworkManager harus melepas interface sebelum tipe link diubah.
-    sh(["nmcli", "device", "disconnect", iface], optional=True)
-    sh(["nmcli", "device", "set", iface, "managed", "no"], optional=True)
-    time.sleep(0.4)
-    sh(["ip", "link", "set", iface, "down"], optional=True)
-    rc = sh(["iw", "dev", iface, "set", "type", "monitor"])
-    if rc != 0:
-        err(
-            f"[priv] Gagal mengaktifkan monitor mode pada {iface}.\n"
-            "[priv] Pastikan adaptor mendukung monitor mode. Cek dengan: iw list | grep -A8 'Supported interface modes'"
-        )
-        restore_managed(iface)
-        return False
-    sh(["ip", "link", "set", iface, "up"], optional=True)
-
-    if channel:
-        rc = sh(["iw", "dev", iface, "set", "channel", str(channel)])
-        if rc != 0:
-            err(f"[priv] Peringatan: gagal menyetel channel {channel}; melanjutkan pada channel saat ini.")
-        else:
-            out(f"[priv] Channel disetel ke {channel}.")
-
-    # Verifikasi agar tool tidak dijalankan dengan mode yang salah.
+def iface_info(name):
+    iw = resolve("iw") or "iw"
     try:
-        iw_path = resolve("iw") or "iw"
         p = subprocess.run(
-            [iw_path, "dev", iface, "info"],
+            [iw, "dev", name, "info"],
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
         )
-        info = (p.stdout or "") + (p.stderr or "")
-    except Exception as exc:  # noqa: BLE001 - tetap coba jalankan tool
-        err(f"[priv] Verifikasi mode gagal: {exc}")
-        info = ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return (p.stdout or "") + (p.stderr or "")
 
+
+def info_channel(info):
+    match = re.search(r"channel\s+(\d+)", info or "")
+    return match.group(1) if match else ""
+
+
+def enter_monitor(iface, channel=None):
+    """Aktifkan monitor mode dan return nama interface yang dipakai.
+
+    iwlwifi AC 8265 tidak selalu benar-benar pindah channel saat interface
+    diubah in-place; firmware tetap di channel asosiasi terakhir. Karena itu
+    helper memakai monitor interface terpisah (mis. wlan0mon) dan memastikan
+    channel-nya disetel sebelum tool dijalankan. Bila pembuatan interface
+    gagal, helper fallback ke konversi in-place.
+    """
+    out(f"[priv] Menyiapkan monitor mode pada {iface}...")
+    sh(["rfkill", "unblock", "wifi"], optional=True)
+    # NetworkManager harus melepas interface sebelum tipe link diubah.
+    sh(["nmcli", "device", "disconnect", iface], optional=True)
+    sh(["nmcli", "device", "set", iface, "managed", "no"], optional=True)
+    time.sleep(0.5)
+    if not wait_disconnected(iface):
+        err(
+            f"[priv] Peringatan: {iface} masih terlihat terasosiasi; "
+            "monitor mode tetap dicoba."
+        )
+    sh(["iw", "dev", iface, "set", "power_save", "off"], optional=True)
+
+    mon = create_monitor_iface(iface, channel)
+    if mon:
+        info = iface_info(mon)
+        active = info_channel(info)
+        if "type monitor" in info and (
+            not channel or active == str(channel)
+        ):
+            out(
+                f"[priv] Monitor mode aktif pada {mon}"
+                + (f" (channel {channel})." if channel else ".")
+            )
+            return mon
+        err(
+            f"[priv] Monitor interface {mon} tidak siap "
+            f"(mode/channel tidak sesuai); mencoba konversi in-place."
+        )
+        if info.strip():
+            for line in info.strip().splitlines():
+                err(f"[priv] {line}")
+        delete_iface(mon)
+
+    # Fallback: konversi interface utama in-place.
+    err(
+        "[priv] Monitor interface terpisah gagal dibuat; "
+        "memakai konversi in-place."
+    )
+    sh(["ip", "link", "set", iface, "down"], optional=True)
+    rc = sh(["iw", "dev", iface, "set", "type", "monitor"])
+    if rc != 0:
+        err(
+            f"[priv] Gagal mengaktifkan monitor mode pada {iface}.\n"
+            "[priv] Pastikan adaptor mendukung monitor mode. Cek dengan: "
+            "iw list | grep -A8 'Supported interface modes'"
+        )
+        restore_managed(iface)
+        return ""
+
+    if channel:
+        # Set saat interface masih down; sebagian driver menerapkan channel
+        # pada saat interface di-up.
+        set_monitor_channel(iface, channel)
+    sh(["ip", "link", "set", iface, "up"], optional=True)
+    if channel:
+        set_monitor_channel(iface, channel)
+        # Jalur wireless-extensions; sebagian firmware iwlwifi hanya menurut
+        # lewat ioctl lama ini.
+        sh(["iwconfig", iface, "channel", str(channel)], optional=True)
+
+    info = iface_info(iface)
     if "type monitor" not in info:
         err(f"[priv] Verifikasi monitor mode gagal untuk {iface}.")
         if info.strip():
             for line in info.strip().splitlines():
                 err(f"[priv] {line}")
         restore_managed(iface)
-        return False
+        return ""
 
-    out(f"[priv] Monitor mode aktif pada {iface}.")
-    return True
+    active = info_channel(info)
+    if channel and active and active != str(channel):
+        err(
+            f"[priv] Peringatan: {iface} melaporkan channel {active}, "
+            f"bukan {channel}. Tool tetap dijalankan."
+        )
+    out(f"[priv] Monitor mode aktif pada {iface} (fallback in-place).")
+    return iface
 
 
 def handle_signal(signum, _frame):
@@ -309,6 +488,26 @@ def handle_signal(signum, _frame):
             _child.send_signal(signal.SIGTERM)
         except Exception:  # noqa: BLE001
             pass
+
+
+def map_iface_args(args, base, mon):
+    """Ganti argumen interface dasar dengan monitor interface.
+
+    Tool seperti reaver/airodump/wash menerima nama interface sebagai argumen
+    terpisah (`-i wlan0`) atau positional (`airodump-ng wlan0`).
+    """
+    if not mon or mon == base:
+        return list(args)
+    mapped = []
+    for arg in args:
+        text = str(arg)
+        if text == base:
+            mapped.append(mon)
+        elif text.startswith(f"--interface={base}"):
+            mapped.append(f"--interface={mon}")
+        else:
+            mapped.append(text)
+    return mapped
 
 
 def monitor_run(iface, channel, tool, args):
@@ -332,17 +531,20 @@ def monitor_run(iface, channel, tool, args):
         err("[priv] monitor-run harus dijalankan sebagai root (via sudo).")
         return 2
 
-    if not enter_monitor(iface, channel or None):
+    mon = enter_monitor(iface, channel or None)
+    if not mon:
         return 3
+
+    tool_args = map_iface_args(args, iface, mon)
 
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, handle_signal)
 
     rc = 1
     try:
-        out(f"[priv] $ {tool} {' '.join(args)}".rstrip())
+        out(f"[priv] $ {tool} {' '.join(tool_args)}".rstrip())
         _child = subprocess.Popen(  # noqa: S603 - argumen list, tanpa shell
-            [path, *args],
+            [path, *tool_args],
             stdin=subprocess.DEVNULL,
         )
         rc = _child.wait()

