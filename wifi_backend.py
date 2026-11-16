@@ -42,6 +42,47 @@ TOOL_PACKAGES = {
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 
+def list_interfaces():
+    """Return sorted names of wireless interfaces (no root required).
+
+    Primary source is /sys/class/net/<if>/wireless, which is reliable and
+    instant. Falls back to `iw dev` and `nmcli` if sysfs yields nothing.
+    """
+    names = set()
+    netdir = "/sys/class/net"
+    try:
+        for entry in os.listdir(netdir):
+            if os.path.exists(os.path.join(netdir, entry, "wireless")):
+                names.add(entry)
+    except OSError:
+        pass
+
+    if not names:
+        try:
+            r = subprocess.run(["iw", "dev"], capture_output=True,
+                               text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                text = line.strip()
+                if text.startswith("Interface "):
+                    names.add(text.split(None, 1)[1])
+        except Exception:
+            pass
+
+    if not names:
+        try:
+            r = subprocess.run(
+                ["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"],
+                capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 2 and parts[1] == "wifi":
+                    names.add(parts[0])
+        except Exception:
+            pass
+
+    return sorted(names)
+
+
 @dataclass
 class Network:
     ssid: str

@@ -143,6 +143,7 @@ class MainWindow(QMainWindow):
         setup_logging()
         self.backend.check_tools()
         self.backend.set_interface(self.backend.config.get("interface", "wlan0"))
+        self.refresh_interfaces()
         self.refresh_tools()
         self.refresh_captures()          # show any existing .cap/.pcap files
         self.scan()
@@ -394,6 +395,29 @@ class MainWindow(QMainWindow):
         if net:
             QApplication.clipboard().setText(net.bssid)
 
+    def refresh_interfaces(self):
+        """Populate the interface combo from detected wireless adapters."""
+        from wifi_backend import list_interfaces
+        ifaces = list_interfaces()
+        current = self.backend.iface
+        self.iface_combo.blockSignals(True)
+        self.iface_combo.clear()
+        self.iface_combo.addItems(ifaces)
+        if current in ifaces:
+            self.iface_combo.setCurrentText(current)
+        elif ifaces:
+            self.iface_combo.setCurrentIndex(0)
+            self.backend.set_interface(ifaces[0])
+        else:
+            self.iface_combo.setPlaceholderText("no wireless interface")
+        self.iface_combo.blockSignals(False)
+        if ifaces:
+            self.statusBar().showMessage(
+                f"Wireless interface: {self.backend.iface}", 5000)
+        else:
+            self.statusBar().showMessage(
+                "No wireless interface detected. Connect a compatible adapter.", 10000)
+
     def on_iface_changed(self, iface):
         if iface and iface != self.backend.iface:
             self.backend.set_interface(iface)
@@ -579,6 +603,12 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- misc
     def scan(self):
+        self.refresh_interfaces()
+        if not self.backend.iface:
+            self.statusBar().showMessage(
+                "No wireless interface. Connect an adapter, then click Scan.", 8000)
+            self.log("[scan] aborted: no wireless interface detected")
+            return
         self.statusBar().showMessage("Scanning…")
         self.log("[scan] starting…")
         self.backend.scan()
@@ -586,7 +616,7 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         dlg = SettingsDialog(self.backend, self)
         if dlg.exec():
-            self.iface_combo.setCurrentText(self.backend.config.get("interface", ""))
+            self.refresh_interfaces()
             self.refresh_tools()
 
     def show_about(self):
