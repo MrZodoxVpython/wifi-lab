@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WiFi Lab
+GenericName=WiFi Auditing Tool
+Comment=GUI for WiFi auditing (handshake capture, WPS, deauth, cracking)
+Exec=wifi-lab
+Icon=wifi-lab
+Terminal=false
+Categories=Network;Utility;Security;
+Keywords=wifi;wireless;security;audit;wpa;wps;
