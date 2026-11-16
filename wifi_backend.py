@@ -42,6 +42,31 @@ TOOL_PACKAGES = {
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 
+def split_nmcli_terse(line):
+    """Split a `nmcli -t` line on unescaped colons.
+
+    nmcli escapes a literal ':' inside a value as '\\:' and a literal '\\' as
+    '\\\\'. Splitting on every ':' (as str.split does) corrupts fields such as
+    BSSID (AA:BB:CC:DD:EE:FF), shifting CHAN/FREQ/SIGNAL into the wrong slots.
+    """
+    fields, cur, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            cur.append(line[i + 1])
+            i += 2
+            continue
+        if ch == ":":
+            fields.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    fields.append("".join(cur))
+    return fields
+
+
 def list_interfaces():
     """Return sorted names of wireless interfaces (no root required).
 
@@ -74,7 +99,7 @@ def list_interfaces():
                 ["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"],
                 capture_output=True, text=True, timeout=10)
             for line in r.stdout.splitlines():
-                parts = line.split(":")
+                parts = split_nmcli_terse(line)
                 if len(parts) >= 2 and parts[1] == "wifi":
                     names.add(parts[0])
         except Exception:
@@ -326,32 +351,38 @@ class WifiBackend(QObject):
         )
         nets = []
         for line in r.stdout.splitlines():
-            parts = line.split(":")
+            parts = split_nmcli_terse(line)
             if len(parts) < 9:
                 continue
             ssid, bssid, chan, freq, sig, sec, active, inuse, mode = parts[:9]
-            if not bssid or bssid == "--":
+            bssid = bssid.strip().lower()
+            if not bssid or bssid == "--" or not _MAC_RE.match(bssid):
+                continue
+            chan = chan.strip()
+            if not chan.isdigit():
                 continue
             nets.append(Network(
                 ssid=ssid,
-                bssid=bssid.lower(),
+                bssid=bssid,
                 channel=chan,
                 frequency=freq,
                 signal=int(sig) if sig.isdigit() else 0,
                 security=self._norm_security(sec),
-                mode=mode,
-                active=(active == "yes"),
-                in_use=(inuse == "*"),
+                mode=mode.strip(),
+                active=(active.strip() == "yes"),
+                in_use=(inuse.strip() == "*"),
                 is_target=(
                     ssid == self.config.get("target_ssid")
-                    or bssid.lower() == (self.config.get("target_bssid") or "").lower()
+                    or bssid == (self.config.get("target_bssid") or "").lower()
                 ),
             ))
         return nets
 
     @staticmethod
     def _norm_security(sec):
-        s = (sec or "").upper()
+        s = (sec or "").strip().upper()
+        if s in ("", "--", "-", "NONE", "OPEN"):
+            return "Open"
         if "WPA3" in s:
             return "WPA3"
         if "WPA2" in s and "WPA1" in s:
