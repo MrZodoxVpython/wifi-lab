@@ -17,6 +17,24 @@ fi
 echo "==> Installing wifi-lab-priv helper"
 install -m 755 "$APP_DIR/wifi-lab-priv" "$BIN_DIR/wifi-lab-priv"
 
+echo "==> Configuring sudoers (NOPASSWD) for the helper"
+TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+SUDOERS_FILE="/etc/sudoers.d/wifi-lab-gui"
+TMP_SUDOERS="$(mktemp)"
+{
+    echo "# Managed by WiFi Lab install.sh — permit the GUI helper without a password"
+    echo "$TARGET_USER ALL=(root) NOPASSWD: $BIN_DIR/wifi-lab-priv"
+} > "$TMP_SUDOERS"
+if visudo -cf "$TMP_SUDOERS" >/dev/null 2>&1; then
+    install -o root -g root -m 0440 "$TMP_SUDOERS" "$SUDOERS_FILE"
+    echo "    allowed user: $TARGET_USER -> $BIN_DIR/wifi-lab-priv"
+else
+    echo "    ERROR: generated sudoers rule failed validation; not installed." >&2
+    rm -f "$TMP_SUDOERS"
+    exit 1
+fi
+rm -f "$TMP_SUDOERS"
+
 echo "==> Installing wifi-lab launcher"
 cat > "$BIN_DIR/wifi-lab" <<EOF
 #!/usr/bin/env bash

@@ -427,11 +427,15 @@ class MainWindow(QMainWindow):
         self.backend.check_tools()
 
     def on_tool_state(self, state):
-        missing = [t for t, ok in state.items() if not ok]
+        tools = {k: v for k, v in state.items() if k in TOOL_PACKAGES}
+        missing = [t for t, ok in tools.items() if not ok]
         if missing:
             self.statusBar().showMessage(
                 "Missing tools: " + ", ".join(missing), 10000)
-        self.helper_label.setText("helper: " + ("✓" if state.get("helper") else "✗"))
+        helper_path = state.get("helper_path", "")
+        self.helper_label.setText(
+            "helper: " + (("✓ " + helper_path) if state.get("helper")
+                          else "✗ belum diotorisasi"))
         self.sudo_label.setText("sudo: " + ("✓" if state.get("sudo") else "✗"))
         self._render_tools(state)
 

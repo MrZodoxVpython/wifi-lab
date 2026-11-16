@@ -67,6 +67,45 @@ def split_nmcli_terse(line):
     return fields
 
 
+_HELPER_CACHE = {"path": None, "checked": False}
+
+
+def resolve_helper(force=False):
+    """Return the first wifi-lab-priv path that sudo lets us run without a
+    password, or None. Probed once and cached (use force=True to re-probe).
+
+    Two installers may have placed a helper: /usr/local/bin (install.sh, GUI)
+    and /usr/local/sbin (setup_privileges.sh, Flask). Only the path listed in
+    sudoers will answer `sudo -n <path> check` successfully.
+    """
+    if _HELPER_CACHE["checked"] and not force:
+        return _HELPER_CACHE["path"]
+
+    candidates = []
+    for path in ("/usr/local/bin/wifi-lab-priv", "/usr/local/sbin/wifi-lab-priv"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            candidates.append(path)
+    found = shutil.which(HELPER)
+    if found and found not in candidates:
+        candidates.append(found)
+
+    chosen = None
+    for path in candidates:
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", path, "check"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0 and "ok" in (r.stdout or "").lower():
+                chosen = path
+                break
+        except Exception:
+            continue
+
+    _HELPER_CACHE.update(path=chosen, checked=True)
+    return chosen
+
+
 def list_interfaces():
     """Return sorted names of wireless interfaces (no root required).
 
@@ -159,9 +198,15 @@ def parse_ap_list(iw_dump):
                     pass
             elif "WPS:" in line:
                 ap["wps"] = True
+            elif "AP Setup Locked:" in line:
+                value = line.split(":", 1)[1].strip()
+                try:
+                    ap["wps_locked"] = bool(int(value, 0))
+                except ValueError:
+                    ap["wps_locked"] = value.lower() not in ("0", "0x0", "no")
             elif "Wi-Fi Protected Setup State:" in line:
-                # state 1 = locked, 2 = unconfigured/open, 3 = configured
-                ap["wps_locked"] = "State: 1" in line
+                # Presence of this attribute also means WPS is advertised.
+                ap["wps"] = True
             elif re.match(r"^\s*WPA:$", line):
                 ap["wpa1"] = True
             elif re.match(r"^\s*RSN:$", line):
@@ -172,6 +217,8 @@ def parse_ap_list(iw_dump):
                 ap["mode"] = "Ad-hoc"
             elif "ESS" in line:
                 ap["mode"] = "Infrastructure"
+        if ap["wps"] and ap["wps_locked"] is None:
+            ap["wps_locked"] = False
         aps.append(ap)
     return aps
 
@@ -248,13 +295,38 @@ class WifiBackend(QObject):
         self.save_config()
 
     # --------------------------- process control ------------------------
-    def _run_helper(self, args, on_line=None):
-        """Run helper as root; stream lines to on_line. Returns (rc, lines)."""
-        helper = shutil.which(HELPER)
+    def _kill_proc(self, proc, timeout=5):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=timeout)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _run_helper(self, args, on_line=None, timeout=None):
+        """Run helper as root; stream lines to on_line. Returns (rc, lines).
+
+        `timeout` (seconds) kills the process tree if it runs too long.
+        """
+        helper = resolve_helper()
+        if not helper:
+            # Re-probe: the user may have just run install.sh (sudoers changed).
+            helper = resolve_helper(force=True)
         if not helper:
             raise RuntimeError(
-                f"{HELPER} not found in PATH. Install it or add its directory "
-                "to PATH, then restart."
+                "Helper root belum diotorisasi. Jalankan: sudo ./install.sh "
+                "(mengonfigurasi sudo NOPASSWD untuk wifi-lab-priv)."
             )
         cmd = ["sudo", "-n", helper] + args
         proc = subprocess.Popen(
@@ -263,6 +335,15 @@ class WifiBackend(QObject):
         )
         with self._lock:
             self._proc = proc
+        timed_out = {"hit": False}
+        timer = None
+        if timeout:
+            def _on_timeout():
+                timed_out["hit"] = True
+                self._kill_proc(proc)
+            timer = threading.Timer(timeout, _on_timeout)
+            timer.daemon = True
+            timer.start()
         lines = []
         try:
             for line in proc.stdout:
@@ -272,8 +353,11 @@ class WifiBackend(QObject):
                 if on_line:
                     on_line(line)
             proc.wait()
-            return proc.returncode, lines
+            rc = 124 if timed_out["hit"] else proc.returncode
+            return rc, lines
         finally:
+            if timer is not None:
+                timer.cancel()
             with self._lock:
                 if self._proc is proc:
                     self._proc = None
@@ -299,12 +383,10 @@ class WifiBackend(QObject):
             state = {}
             for tool in TOOL_PACKAGES:
                 state[tool] = shutil.which(tool) is not None
-            state["helper"] = shutil.which(HELPER) is not None
-            try:
-                subprocess.run(["sudo", "-n", "true"], timeout=5, check=True)
-                state["sudo"] = True
-            except Exception:
-                state["sudo"] = False
+            helper = resolve_helper(force=True)
+            state["helper"] = helper is not None
+            state["sudo"] = helper is not None
+            state["helper_path"] = helper or ""
             self._emit_tool_state(state)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -401,11 +483,21 @@ class WifiBackend(QObject):
         """Merge iw scan data (WPS, channel, exact security) into networks."""
         try:
             rc, lines = self._run_helper(["scan", self.iface], timeout=60)
-        except Exception:
+        except Exception as exc:
+            self._emit_progress(f"[wps] info WPS tidak tersedia: {exc}")
             return
         if rc != 0:
+            detail = next((l for l in reversed(lines) if l.strip()), "")
+            self._emit_progress(
+                "[wps] scan iw gagal (status WPS tidak terisi). "
+                f"{detail} — pastikan helper diotorisasi: sudo ./install.sh"
+            )
             return
         aps = parse_ap_list("\n".join(lines))
+        if not aps:
+            self._emit_progress(
+                "[wps] scan iw tidak mengembalikan BSS; status WPS dilewati.")
+            return
         by_mac = {ap["bssid"]: ap for ap in aps}
         for net in networks:
             ap = by_mac.get(net.bssid)

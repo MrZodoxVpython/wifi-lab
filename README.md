@@ -114,9 +114,17 @@ Stored at `~/.local/share/wifi-lab/config.json`:
 
 ## Troubleshooting
 
-- **"sudo: a password is required"** — configure passwordless sudo for
-  `wifi-lab-priv` (see below), or run the app from a terminal where sudo is
-  unlocked.
+- **Colom WPS kosong** — status WPS dibaca lewat `iw scan` sebagai root. Jika
+  helper belum diotorisasi sudo, kolom WPS tetap kosong (lihat label
+  `helper:`/`sudo:` di pojok kanan atas). Perbaiki dengan:
+  ```bash
+  sudo ./install.sh      # pasang helper + atur sudo NOPASSWD otomatis
+  ```
+  Lalu mulai ulang aplikasi dan klik **Scan**.
+- **"sudo: a password is required"** — jalankan `sudo ./install.sh`. Installer
+  membuat `/etc/sudoers.d/wifi-lab-gui` untuk user pemanggil. Bila ada helper
+  lama di `/usr/local/sbin` (dari setup Flask), aplikasi otomatis memakai jalur
+  yang sudah diotorisasi; menjalankan `install.sh` terbaru lebih disarankan.
 - **No networks found** — make sure the interface is up and NetworkManager is
   managing it (`nmcli radio wifi on`).
 - **Handshake not captured** — the target may be idle (no clients). Run
@@ -126,10 +134,11 @@ Stored at `~/.local/share/wifi-lab/config.json`:
 
 ### Passwordless sudo for the helper
 
-Create `/etc/sudoers.d/wifi-lab`:
+`sudo ./install.sh` menulis aturan ini secara otomatis dan memvalidasinya dengan
+`visudo`:
 
 ```
 youruser ALL=(root) NOPASSWD: /usr/local/bin/wifi-lab-priv
 ```
 
-Then `sudo chmod 440 /etc/sudoers.d/wifi-lab`.
+File: `/etc/sudoers.d/wifi-lab-gui` (mode `0440`).
