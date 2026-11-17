@@ -617,7 +617,9 @@ class WifiBackend(QObject):
         if pin:
             args += ["-p", pin]
         else:
-            args += ["-K", "1"]
+            # -K/--pixie-dust tidak menerima argumen; "1" hanya menjadi argumen
+            # liar yang diabaikan reaver.
+            args += ["-K"]
         timeout = int(self.config.get("reaver_timeout", 600))
         self._stop_requested.clear()
 

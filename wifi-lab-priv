@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 ALLOWED_TOOLS = {
     "airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng",
@@ -284,6 +284,95 @@ def wait_disconnected(iface, attempts=10):
     return False
 
 
+def _monitor_name(iface):
+    """Nama monitor interface khusus (maks. 15 karakter / IFNAMSIZ-1)."""
+    return f"{iface}mon"[:15]
+
+
+def _iface_info(iface):
+    r = run_sync(["iw", "dev", iface, "info"], 10)
+    if r is None:
+        return ""
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def _iface_channel(info):
+    match = re.search(r"channel\s+(\d+)", info or "")
+    return match.group(1) if match else ""
+
+
+def _phy_name(iface):
+    for line in _iface_info(iface).splitlines():
+        text = line.strip()
+        if text.startswith("wiphy "):
+            return "phy" + text.split(None, 1)[1]
+    return ""
+
+
+def _delete_iface(name):
+    if not iface_exists(name):
+        return
+    run_sync(["ip", "link", "set", name, "down"], 10)
+    run_sync(["iw", "dev", name, "del"], 10)
+
+
+def _set_monitor_channel(mon, channel):
+    """Set channel monitor; coba beberapa metode bila driver menolak."""
+    ch = str(channel)
+    r = run_sync(["iw", "dev", mon, "set", "channel", ch], 20)
+    ok = r is not None and r.returncode == 0
+    if not ok:
+        # Sebagian driver lebih menerima frekuensi eksplisit.
+        try:
+            number = int(ch)
+        except ValueError:
+            number = 0
+        freq = 0
+        if 1 <= number <= 13:
+            freq = 2407 + number * 5
+        elif number == 14:
+            freq = 2484
+        elif 15 <= number <= 200:
+            freq = (number + 1000) * 5
+        if freq:
+            r = run_sync(["iw", "dev", mon, "set", "freq", str(freq)], 20)
+            ok = r is not None and r.returncode == 0
+    if not ok:
+        r = run_sync(["iwconfig", mon, "channel", ch], 20)
+        ok = r is not None and r.returncode == 0
+    if ok:
+        out(f"[priv] Channel {ch} disetel pada {mon}.")
+    else:
+        err(f"[priv] Peringatan: gagal menyetel channel {ch} pada {mon}.")
+    return ok
+
+
+def _create_monitor_iface(iface, channel=None):
+    """Buat monitor interface terpisah via `iw`; return namanya atau ""."""
+    mon = _monitor_name(iface)
+    _delete_iface(mon)
+
+    # Managed interface harus down agar slot channel-nya lepas dari firmware.
+    run_sync(["ip", "link", "set", iface, "down"], 15)
+    r = run_sync(
+        ["iw", "dev", iface, "interface", "add", mon, "type", "monitor"], 20
+    )
+    if r is None or r.returncode != 0:
+        phy = _phy_name(iface)
+        if phy:
+            r = run_sync(
+                ["iw", "phy", phy, "interface", "add", mon, "type", "monitor"], 20
+            )
+    if r is None or r.returncode != 0:
+        _delete_iface(mon)
+        return ""
+
+    run_sync(["ip", "link", "set", mon, "up"], 15)
+    if channel:
+        _set_monitor_channel(mon, channel)
+    return mon
+
+
 def _restore_link(iface, reconnect=True):
     """Kembalikan interface ke managed mode dan sambungkan profil sebelumnya.
 
@@ -291,7 +380,7 @@ def _restore_link(iface, reconnect=True):
     terpisah setelah helper utama terbunuh.
     """
     base = iface[:-3] if iface.endswith("mon") else iface
-    mon = base + "mon"
+    mon = _monitor_name(base)
     state = load_state(base)
     was_connected = bool(state.get("was_connected", True))
     uuid = state.get("connection_uuid") or ""
@@ -320,16 +409,18 @@ def _restore_link(iface, reconnect=True):
                 break
             time.sleep(1)
 
-    # Hentikan airmon-ng dan pulihkan nama interface asli bila ter-rename.
-    for target in {mon, iface}:
-        if target and target != base and iface_exists(target):
-            run_sync(["airmon-ng", "stop", target], 15)
-            if iface_exists(base):
-                break
-    if not iface_exists(base) and iface_exists(mon):
-        run_sync(["ip", "link", "set", mon, "down"], 10)
-        run_sync(["ip", "link", "set", mon, "name", base], 10)
-        time.sleep(0.5)
+    # Buang monitor interface pasangan (mis. wlan0mon) sebelum restore.
+    if mon != base and iface_exists(mon):
+        if iface_exists(base):
+            # Monitor interface terpisah yang dibuat helper via `iw`.
+            _delete_iface(mon)
+        else:
+            # Interface dasar hilang (ter-rename oleh airmon-ng sesi lama).
+            run_sync(["airmon-ng", "stop", mon], 15)
+            if not iface_exists(base) and iface_exists(mon):
+                run_sync(["ip", "link", "set", mon, "down"], 10)
+                run_sync(["ip", "link", "set", mon, "name", base], 10)
+                time.sleep(0.5)
 
     if not iface_exists(base):
         err(f"[priv] ERROR: interface {base} tidak ditemukan setelah restore.")
@@ -389,8 +480,12 @@ def restore_managed(iface):
 def enter_monitor(iface, channel=None):
     """Put iface into monitor mode; return monitor iface name or None.
 
-    Radio WiFi TIDAK dimatikan. NetworkManager cukup dilepas dari interface
-    supaya airmon-ng bisa mengambil alih.
+    Monitor mode dibuat lewat `iw` pada interface terpisah (mis. wlan0mon),
+    bukan lewat airmon-ng. airmon-ng sering menggantung (timeout 60 detik)
+    pada driver seperti iwlwifi dan me-rename interface, sehingga tool audit
+    gagal dijalankan dengan pesan "airmon-ng start failed: timeout".
+
+    Radio WiFi TIDAK dimatikan. NetworkManager cukup dilepas dari interface.
     """
     global _stop_requested
 
@@ -419,20 +514,53 @@ def enter_monitor(iface, channel=None):
     if _stop_requested:
         return None
 
-    r = run_sync(["airmon-ng", "start", iface, channel or "0"], 60)
-    if r is None or r.returncode != 0:
-        detail = ((r.stdout or "") + (r.stderr or "")).strip() if r else "timeout"
-        err(f"ERROR: airmon-ng start failed: {detail.splitlines()[-1] if detail else 'unknown'}")
+    # Jalur utama: monitor interface terpisah via `iw` (tanpa airmon-ng).
+    mon = _create_monitor_iface(iface, channel)
+    if _stop_requested:
+        if mon:
+            _delete_iface(mon)
         return None
-    mon = iface + "mon"
-    if not iface_exists(mon):
-        mon = iface  # driver did not rename
+    if mon:
+        info = _iface_info(mon)
+        if "type monitor" in info:
+            active = _iface_channel(info)
+            if channel and active and active != str(channel):
+                err(
+                    f"[priv] Peringatan: {mon} melaporkan channel {active}, "
+                    f"bukan {channel}. Tool tetap dijalankan."
+                )
+            out(f"[priv] monitor mode active on {mon} (channel {channel or 'any'})")
+            return mon
+        err(f"[priv] Monitor interface {mon} bukan monitor mode; mencoba konversi in-place.")
+        _delete_iface(mon)
+
     if _stop_requested:
         return None
+
+    # Fallback: konversi interface utama in-place (driver tanpa dukungan
+    # pembuatan interface monitor terpisah).
+    err("[priv] Monitor interface terpisah gagal dibuat; memakai konversi in-place.")
+    run_sync(["ip", "link", "set", iface, "down"], 15)
+    r = run_sync(["iw", "dev", iface, "set", "type", "monitor"], 20)
+    if r is None or r.returncode != 0:
+        err(
+            f"ERROR: gagal mengaktifkan monitor mode pada {iface}. "
+            "Pastikan adaptor mendukung monitor mode."
+        )
+        return None
     if channel:
-        run_sync(["iw", "dev", mon, "set", "channel", str(channel)], 30)
-    out(f"[priv] monitor mode active on {mon} (channel {channel or 'any'})")
-    return mon
+        _set_monitor_channel(iface, channel)
+    run_sync(["ip", "link", "set", iface, "up"], 15)
+    if channel:
+        _set_monitor_channel(iface, channel)
+        run_sync(["iwconfig", iface, "channel", str(channel)], 15)
+
+    info = _iface_info(iface)
+    if "type monitor" not in info:
+        err(f"ERROR: verifikasi monitor mode gagal untuk {iface}.")
+        return None
+    out(f"[priv] monitor mode active on {iface} (fallback in-place, channel {channel or 'any'})")
+    return iface
 
 
 # ---------------------------------------------------------------------------
