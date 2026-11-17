@@ -338,11 +338,19 @@ class Job:
             return
         try:
             if proc.poll() is None:
-                proc.terminate()
+                # start_new_session=True: bunuh seluruh grup agar helper ikut
+                # menerima SIGTERM dan menjalankan restore managed mode.
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
                 try:
                     proc.wait(timeout=grace)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
         except Exception:
             pass
 
@@ -514,8 +522,20 @@ def _ensure_link_restored(job, iface, attempts=4):
     for attempt in range(1, attempts + 1):
         rc, info, _ = run_cmd(["iw", "dev", iface, "info"], timeout=20)
         if "type monitor" in info:
-            job.append(f"[system] menunggu {iface} keluar dari monitor mode…")
-            time.sleep(2)
+            if attempt == 1:
+                job.append(
+                    f"[system] {iface} masih monitor mode; menjalankan restore helper…"
+                )
+                rc, out, err = run_cmd(restore_command(iface), timeout=120)
+                for line in (out or "").splitlines():
+                    if line.strip():
+                        job.append(line)
+                for line in (err or "").splitlines():
+                    if line.strip():
+                        job.append(line)
+            else:
+                job.append(f"[system] menunggu {iface} keluar dari monitor mode…")
+                time.sleep(2)
             continue
 
         rc, state, _ = run_cmd(
@@ -529,6 +549,34 @@ def _ensure_link_restored(job, iface, attempts=4):
             return True
 
         job.append(f"[system] menyambungkan ulang {iface} ({attempt}/{attempts})…")
+        if attempt == 1:
+            # Restore lewat helper: menyalakan radio yang mungkin masih
+            # soft-blocked, mengembalikan nama interface, lalu reconnect.
+            job.append(
+                "[system] menjalankan restore helper "
+                "(radio WiFi / soft-block / managed mode)..."
+            )
+            rc, out, err = run_cmd(restore_command(iface), timeout=120)
+            for line in (out or "").splitlines():
+                if line.strip():
+                    job.append(line)
+            for line in (err or "").splitlines():
+                if line.strip():
+                    job.append(line)
+            if rc == 0:
+                rc, state, _ = run_cmd(
+                    ["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
+                    timeout=30,
+                )
+                connected = any(
+                    line.startswith(f"{iface}:connected")
+                    for line in state.splitlines()
+                )
+                if connected:
+                    job.append(f"[system] {iface} managed dan tersambung kembali.")
+                    return True
+            time.sleep(1)
+            continue
         run_cmd(["nmcli", "device", "set", iface, "managed", "yes"], timeout=30)
         run_cmd(["nmcli", "device", "connect", iface], timeout=60)
         time.sleep(2)

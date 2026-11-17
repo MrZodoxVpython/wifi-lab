@@ -9,16 +9,24 @@ Runs as root (via sudo). Actions:
   handshake IFACE CHANNEL BSSID OUTPREFIX [TIMEOUT]
   restore IFACE      back to managed mode
   install PACKAGE    apt-get install -y
+
+Catatan penting: helper ini TIDAK pernah mematikan radio WiFi. Saat Stop
+(SIGTERM) diterima, proses tool dihentikan lalu interface selalu dipulihkan ke
+managed mode di blok finally. Sebelumnya `nmcli radio wifi off` dipakai dan
+helper bisa terbunuh sebelum menyalakannya lagi, sehingga adapter tertinggal
+"Soft blocked: yes".
 """
+import json
 import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 ALLOWED_TOOLS = {
     "airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng",
@@ -36,13 +44,34 @@ IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
 CHANNEL_RE = re.compile(r"^[0-9]{1,4}$")
 HEX_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
+STATE_DIR = "/run/wifi-lab"
+
+# Proses tool yang sedang berjalan (untuk dihentikan saat menerima sinyal).
+_children = []
+_child = None
+_stop_requested = False
+_cleaning = False
+
 
 def out(msg=""):
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except (BrokenPipeError, OSError):
+        # Parent (GUI/sudo) sudah menutup pipe. Cleanup tetap harus jalan.
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
 
 
 def err(msg):
-    print(msg, file=sys.stderr, flush=True)
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except (BrokenPipeError, OSError):
+        try:
+            sys.stderr = open(os.devnull, "w")
+        except OSError:
+            pass
 
 
 def check_root():
@@ -51,60 +80,364 @@ def check_root():
         sys.exit(2)
 
 
+def _env():
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    return env
+
+
 def run_sync(cmd, timeout=60):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            check=False, env=_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
 
 
 def stream_run(cmd):
     """Run command and stream its stdout/stderr lines to our stdout."""
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=_env(),
     )
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-    return proc.wait()
+    _register_child(proc)
+    try:
+        for line in proc.stdout:
+            try:
+                print(line, end="", flush=True)
+            except (BrokenPipeError, OSError):
+                pass
+        return proc.wait()
+    finally:
+        _unregister_child(proc)
 
 
 def iface_exists(iface):
     return bool(iface) and os.path.exists(f"/sys/class/net/{iface}")
 
 
+# ---------------------------------------------------------------------------
+# Penghentian aman + pemulihan interface
+# ---------------------------------------------------------------------------
+
+def _register_child(proc):
+    global _child
+    _child = proc
+    if proc not in _children:
+        _children.append(proc)
+
+
+def _unregister_child(proc):
+    global _child
+    if proc in _children:
+        _children.remove(proc)
+    if _child is proc:
+        _child = None
+
+
+def _terminate_children(sig=signal.SIGTERM):
+    for proc in list(_children):
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.send_signal(sig)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _kill_children_later(delay=8.0):
+    """Bunuh paksa tool yang mengabaikan SIGTERM, tanpa mengorbankan cleanup."""
+    def worker():
+        time.sleep(delay)
+        _terminate_children(signal.SIGKILL)
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
+def handle_signal(signum, _frame):
+    """SIGTERM/SIGINT dari tombol Stop: hentikan tool, JANGAN matikan helper.
+
+    Cleanup (restore managed mode) harus tetap berjalan. Sinyal berikutnya saat
+    cleanup diabaikan agar proses pemulihan tidak terpotong.
+    """
+    global _stop_requested
+    if _cleaning or _stop_requested:
+        return
+    _stop_requested = True
+    out(f"[priv] Menerima sinyal {signum}; menghentikan tool dan memulihkan interface...")
+    _terminate_children()
+    _kill_children_later()
+
+
+def install_signal_handlers():
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, handle_signal)
+        except (ValueError, OSError):
+            pass
+
+
+def _state_path(iface):
+    return os.path.join(STATE_DIR, f"{iface}.json")
+
+
+def _split_nmcli(value):
+    """Pisahkan output `nmcli -t` pada ':' yang tidak di-escape."""
+    fields, cur, index = [], [], 0
+    while index < len(value):
+        ch = value[index]
+        if ch == "\\" and index + 1 < len(value):
+            cur.append(value[index + 1])
+            index += 2
+        elif ch == ":":
+            fields.append("".join(cur))
+            cur = []
+            index += 1
+        else:
+            cur.append(ch)
+            index += 1
+    fields.append("".join(cur))
+    return fields
+
+
+def device_state(iface):
+    """STATE NetworkManager untuk iface ('connected', 'connecting', ...)."""
+    r = run_sync(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"], 20)
+    if r is None:
+        return ""
+    for line in (r.stdout or "").splitlines():
+        parts = _split_nmcli(line)
+        if len(parts) >= 2 and parts[0] == iface:
+            return parts[1]
+    return ""
+
+
+def is_connected(iface):
+    return device_state(iface).startswith("connected")
+
+
+def active_connection_uuid(iface):
+    """UUID profil NetworkManager yang sedang aktif pada iface (bila ada)."""
+    r = run_sync(
+        ["nmcli", "-t", "-f", "UUID,DEVICE", "connection", "show", "--active"], 20
+    )
+    if r is None or r.returncode != 0:
+        return ""
+    for line in (r.stdout or "").splitlines():
+        parts = _split_nmcli(line)
+        if len(parts) >= 2 and parts[1] == iface and parts[0]:
+            return parts[0]
+    return ""
+
+
+def radio_enabled():
+    r = run_sync(["nmcli", "-t", "-f", "WIFI", "radio"], 10)
+    if r is None:
+        return True
+    text = (r.stdout or "").strip().lower()
+    return "enabled:enabled" in text or text.splitlines()[-1:] == ["enabled"]
+
+
+def save_state(iface):
+    """Simpan profil koneksi sebelum interface dipakai untuk monitor mode.
+
+    File ini dibaca lagi oleh `restore` (termasuk saat dipanggil terpisah
+    setelah helper terbunuh), sehingga WiFi bisa tersambung kembali ke jaringan
+    yang sama seperti sebelumnya.
+    """
+    state = {
+        "iface": iface,
+        "connection_uuid": active_connection_uuid(iface),
+        "was_connected": is_connected(iface),
+        "radio_enabled": radio_enabled(),
+        "saved_at": time.time(),
+    }
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(_state_path(iface), "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+    except OSError:
+        pass
+    return state
+
+
+def load_state(iface):
+    try:
+        with open(_state_path(iface), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def wait_disconnected(iface, attempts=10):
+    """Tunggu sampai station benar-benar lepas dari AP sebelum ganti mode."""
+    for _ in range(attempts):
+        r = run_sync(["iw", "dev", iface, "link"], 5)
+        info = ((r.stdout or "") + (r.stderr or "")) if r is not None else ""
+        if "Not connected" in info or not info.strip():
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _restore_link(iface, reconnect=True):
+    """Kembalikan interface ke managed mode dan sambungkan profil sebelumnya.
+
+    Idempoten: aman dipanggil berkali-kali, termasuk dari proses `restore`
+    terpisah setelah helper utama terbunuh.
+    """
+    base = iface[:-3] if iface.endswith("mon") else iface
+    mon = base + "mon"
+    state = load_state(base)
+    was_connected = bool(state.get("was_connected", True))
+    uuid = state.get("connection_uuid") or ""
+    # State lama (atau belum ada state) dianggap radio sedang aktif.
+    radio_was_on = bool(state.get("radio_enabled", True))
+
+    if radio_was_on:
+        run_sync(["rfkill", "unblock", "wifi"], 15)
+        run_sync(["rfkill", "unblock", "all"], 15)
+
+    # Idempoten: kalau interface sudah managed + tersambung dan tidak ada sisa
+    # monitor interface, jangan turunkan link (itu akan memutus WiFi sebentar).
+    # Beri kesempatan singkat bila NetworkManager masih dalam state "connecting".
+    if iface_exists(base) and not iface_exists(mon):
+        for _ in range(6):
+            if is_connected(base):
+                if radio_was_on:
+                    run_sync(["rfkill", "unblock", "wifi"], 15)
+                    run_sync(["nmcli", "radio", "wifi", "on"], 15)
+                out(
+                    f"[priv] {base} sudah managed dan tersambung; "
+                    "tidak ada yang perlu diubah."
+                )
+                return True
+            if not device_state(base).startswith("connecting"):
+                break
+            time.sleep(1)
+
+    # Hentikan airmon-ng dan pulihkan nama interface asli bila ter-rename.
+    for target in {mon, iface}:
+        if target and target != base and iface_exists(target):
+            run_sync(["airmon-ng", "stop", target], 15)
+            if iface_exists(base):
+                break
+    if not iface_exists(base) and iface_exists(mon):
+        run_sync(["ip", "link", "set", mon, "down"], 10)
+        run_sync(["ip", "link", "set", mon, "name", base], 10)
+        time.sleep(0.5)
+
+    if not iface_exists(base):
+        err(f"[priv] ERROR: interface {base} tidak ditemukan setelah restore.")
+        return False
+
+    out(f"[priv] Mengembalikan {base} ke managed mode...")
+    run_sync(["ip", "link", "set", base, "down"], 10)
+    run_sync(["iw", "dev", base, "set", "type", "managed"], 15)
+    run_sync(["ip", "link", "set", base, "up"], 10)
+
+    # Pastikan radio benar-benar aktif lagi (memperbaiki soft-block lama).
+    if radio_was_on:
+        run_sync(["rfkill", "unblock", "wifi"], 15)
+        run_sync(["nmcli", "radio", "wifi", "on"], 15)
+    run_sync(["nmcli", "device", "set", base, "managed", "yes"], 20)
+
+    connected = is_connected(base)
+    if reconnect and was_connected:
+        for attempt in range(1, 4):
+            if connected:
+                break
+            out(f"[priv] Menyambungkan ulang {base} ({attempt}/3)...")
+            if uuid and attempt <= 2:
+                run_sync(["nmcli", "connection", "up", "uuid", uuid], 25)
+            if not is_connected(base):
+                run_sync(["nmcli", "device", "connect", base], 25)
+            time.sleep(1.5)
+            connected = is_connected(base)
+
+    if connected:
+        out(f"[priv] {base} kembali ke managed mode dan tersambung.")
+        return True
+    if not was_connected:
+        out(f"[priv] {base} kembali ke managed mode (tidak ada koneksi aktif sebelumnya).")
+        return True
+    err(
+        f"[priv] PERINGATAN: {base} kembali ke managed mode tetapi belum tersambung.\n"
+        f"[priv] Pilih jaringan di NetworkManager atau jalankan: nmcli device connect {base}"
+    )
+    return False
+
+
+def restore_managed(iface):
+    """Restore final: abaikan sinyal tambahan sampai pemulihan selesai."""
+    global _cleaning
+    _cleaning = True
+    try:
+        return _restore_link(iface, reconnect=True)
+    finally:
+        _cleaning = False
+
+
+# ---------------------------------------------------------------------------
+# Monitor mode
+# ---------------------------------------------------------------------------
+
 def enter_monitor(iface, channel=None):
-    """Put iface into monitor mode; return monitor iface name or None."""
+    """Put iface into monitor mode; return monitor iface name or None.
+
+    Radio WiFi TIDAK dimatikan. NetworkManager cukup dilepas dari interface
+    supaya airmon-ng bisa mengambil alih.
+    """
+    global _stop_requested
+
+    if not iface_exists(iface):
+        # Mungkin interface masih ter-rename dari sesi sebelumnya (wlan0mon).
+        _restore_link(iface, reconnect=False)
     if not iface_exists(iface):
         err(f"ERROR: interface {iface} not found")
         return None
-    # Stop NetworkManager interference so airmon can take the interface.
-    run_sync(["nmcli", "radio", "wifi", "off"], timeout=30)
-    time.sleep(1)
-    r = run_sync(["airmon-ng", "start", iface, channel or "0"], timeout=60)
+    if _stop_requested:
+        return None
+
+    save_state(iface)
+
+    if radio_enabled():
+        run_sync(["rfkill", "unblock", "wifi"], 15)
+
+    # Lepaskan hanya interface ini; jangan mematikan seluruh radio WiFi.
+    run_sync(["nmcli", "device", "disconnect", iface], 30)
+    run_sync(["nmcli", "device", "set", iface, "managed", "no"], 20)
+    time.sleep(0.5)
+    if not wait_disconnected(iface):
+        err(f"[priv] Peringatan: {iface} masih terlihat terasosiasi; monitor mode tetap dicoba.")
+    run_sync(["iw", "dev", iface, "set", "power_save", "off"], 10)
+
+    if _stop_requested:
+        return None
+
+    r = run_sync(["airmon-ng", "start", iface, channel or "0"], 60)
     if r is None or r.returncode != 0:
-        err(f"ERROR: airmon-ng start failed: {(r.stderr if r else 'timeout').strip()}")
+        detail = ((r.stdout or "") + (r.stderr or "")).strip() if r else "timeout"
+        err(f"ERROR: airmon-ng start failed: {detail.splitlines()[-1] if detail else 'unknown'}")
         return None
     mon = iface + "mon"
     if not iface_exists(mon):
         mon = iface  # driver did not rename
+    if _stop_requested:
+        return None
     if channel:
-        run_sync(["iw", "dev", mon, "set", "channel", str(channel)], timeout=30)
+        run_sync(["iw", "dev", mon, "set", "channel", str(channel)], 30)
     out(f"[priv] monitor mode active on {mon} (channel {channel or 'any'})")
     return mon
 
 
-def restore_managed(iface):
-    mon = iface + "mon"
-    target = mon if iface_exists(mon) else iface
-    run_sync(["airmon-ng", "stop", target], timeout=60)
-    run_sync(["nmcli", "radio", "wifi", "on"], timeout=30)
-    time.sleep(1)
-    run_sync(["nmcli", "device", "connect", iface], timeout=30)
-
-
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Actions
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def action_check():
     out(f"OK wifi-lab-priv {VERSION}")
@@ -114,10 +447,10 @@ def action_scan(iface):
     if not iface_exists(iface):
         err("ERROR: interface not found")
         return 3
-    run_sync(["ip", "link", "set", iface, "up"], timeout=30)
-    r = run_sync(["iw", "dev", iface, "scan", "dump", "-b"], timeout=30)
+    run_sync(["ip", "link", "set", iface, "up"], 30)
+    r = run_sync(["iw", "dev", iface, "scan", "dump", "-b"], 30)
     if r is None or r.returncode != 0 or "BSS " not in (r.stdout or ""):
-        r = run_sync(["iw", "dev", iface, "scan", "-b"], timeout=60)
+        r = run_sync(["iw", "dev", iface, "scan", "-b"], 60)
     if r is None or r.returncode != 0:
         err("ERROR: iw scan failed")
         return 3
@@ -133,6 +466,7 @@ def action_run(tool, args):
     if not path:
         err(f"ERROR: {tool} not installed (package: {PACKAGES.get(tool, tool)})")
         return 3
+    install_signal_handlers()
     return stream_run([path] + args)
 
 
@@ -144,12 +478,17 @@ def action_monitor_run(iface, channel, tool, args):
     if not path:
         err(f"ERROR: {tool} not installed (package: {PACKAGES.get(tool, tool)})")
         return 3
-    mon = enter_monitor(iface, None if channel == "-" else channel)
-    if not mon:
-        return 3
-    mapped = [mon if a == iface else a for a in args]
+
+    install_signal_handlers()
     try:
-        return stream_run([path] + mapped)
+        mon = enter_monitor(iface, None if channel == "-" else channel)
+        if _stop_requested:
+            return 130
+        if not mon:
+            return 3
+        mapped = [mon if a == iface else a for a in args]
+        rc = stream_run([path] + mapped)
+        return 130 if _stop_requested else rc
     finally:
         restore_managed(iface)
 
@@ -161,25 +500,35 @@ def action_handshake(iface, channel, bssid, outprefix, timeout):
     if not HEX_MAC_RE.fullmatch(bssid or ""):
         err("ERROR: invalid BSSID")
         return 3
-    mon = enter_monitor(iface, channel)
-    if not mon:
-        return 3
-    band = "a" if int(channel) > 14 else "bg"
-    os.makedirs(os.path.dirname(outprefix) or ".", exist_ok=True)
-    airodump = subprocess.Popen(
-        ["airodump-ng", mon, "--bssid", bssid, "--channel", channel,
-         "--band", band, "--write", outprefix, "--write-interval", "1",
-         "--output-format", "pcap"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    aireplay = subprocess.Popen(
-        ["aireplay-ng", mon, "--deauth", "0", "-a", bssid],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    deadline = time.time() + max(10, int(timeout or 120))
-    found = False
+
+    install_signal_handlers()
+    airodump = None
+    aireplay = None
     try:
-        while time.time() < deadline:
+        mon = enter_monitor(iface, channel)
+        if _stop_requested:
+            return 130
+        if not mon:
+            return 3
+        band = "a" if int(channel) > 14 else "bg"
+        os.makedirs(os.path.dirname(outprefix) or ".", exist_ok=True)
+        airodump = subprocess.Popen(
+            ["airodump-ng", mon, "--bssid", bssid, "--channel", channel,
+             "--band", band, "--write", outprefix, "--write-interval", "1",
+             "--output-format", "pcap"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env=_env(),
+        )
+        _register_child(airodump)
+        aireplay = subprocess.Popen(
+            ["aireplay-ng", mon, "--deauth", "0", "-a", bssid],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=_env(),
+        )
+        _register_child(aireplay)
+        deadline = time.time() + max(10, int(timeout or 120))
+        found = False
+        while time.time() < deadline and not _stop_requested:
             line = airodump.stdout.readline()
             if not line:
                 if airodump.poll() is not None:
@@ -193,12 +542,29 @@ def action_handshake(iface, channel, bssid, outprefix, timeout):
                 found = True
                 break
     finally:
-        aireplay.terminate()
-        time.sleep(1)
-        airodump.terminate()
-        airodump.wait()
-        aireplay.wait()
+        for proc in (aireplay, airodump):
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
+        time.sleep(0.5)
+        for proc in (aireplay, airodump):
+            if proc is None:
+                continue
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:  # noqa: BLE001
+                    pass
+            _unregister_child(proc)
         restore_managed(iface)
+
+    if _stop_requested:
+        return 130
     if found:
         out("HANDSHAKE_FOUND")
         return 0
@@ -206,12 +572,24 @@ def action_handshake(iface, channel, bssid, outprefix, timeout):
     return 1
 
 
+def action_restore(iface):
+    if not IFACE_RE.fullmatch(iface or ""):
+        err(f"ERROR: nama interface tidak valid: {iface!r}")
+        return 2
+    install_signal_handlers()
+    ok = restore_managed(iface)
+    if ok:
+        out("OK restored")
+        return 0
+    return 1
+
+
 def action_install(package):
-    r = run_sync(["apt-get", "update"], timeout=300)
+    r = run_sync(["apt-get", "update"], 300)
     if r is None or r.returncode != 0:
         err("ERROR: apt-get update failed")
         return 3
-    r = run_sync(["apt-get", "install", "-y", package], timeout=600)
+    r = run_sync(["apt-get", "install", "-y", package], 600)
     if r is None or r.returncode != 0:
         err("ERROR: install failed")
         return 3
@@ -240,9 +618,7 @@ def main():
     if action == "install" and len(args) >= 1:
         return action_install(args[0])
     if action == "restore" and len(args) >= 1:
-        restore_managed(args[0])
-        out("OK restored")
-        return 0
+        return action_restore(args[0])
     err("ERROR: bad action or arguments")
     return 2
 

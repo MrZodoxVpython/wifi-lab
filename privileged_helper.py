@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 SEARCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -53,14 +54,28 @@ MONITOR_EXCLUDED = {"iw", "ip", "nmcli", "rfkill", "airmon-ng"}
 RUN_EXCLUDED = {"iw", "ip", "nmcli", "rfkill", "airmon-ng"}
 
 _child = None
+_stop_requested = False
+_cleaning = False
 
 
 def out(message=""):
-    print(message, flush=True)
+    try:
+        print(message, flush=True)
+    except (BrokenPipeError, OSError):
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
 
 
 def err(message):
-    print(message, file=sys.stderr, flush=True)
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (BrokenPipeError, OSError):
+        try:
+            sys.stderr = open(os.devnull, "w")
+        except OSError:
+            pass
 
 
 def resolve(tool):
@@ -228,6 +243,12 @@ def restore_managed(iface):
     mon = monitor_name(iface)
     if mon != iface:
         delete_iface(mon)
+
+    # Bersihkan soft-block yang mungkin ditinggalkan sesi sebelumnya, lalu
+    # pastikan radio WiFi aktif kembali sebelum menyambung.
+    sh(["rfkill", "unblock", "wifi"], optional=True)
+    sh(["rfkill", "unblock", "all"], optional=True)
+    sh(["nmcli", "radio", "wifi", "on"], optional=True)
 
     out(f"[priv] Mengembalikan {iface} ke managed mode...")
     sh(["ip", "link", "set", iface, "down"], optional=True)
@@ -406,6 +427,8 @@ def enter_monitor(iface, channel=None):
     sh(["nmcli", "device", "disconnect", iface], optional=True)
     sh(["nmcli", "device", "set", iface, "managed", "no"], optional=True)
     time.sleep(0.5)
+    if _stop_requested:
+        return ""
     if not wait_disconnected(iface):
         err(
             f"[priv] Peringatan: {iface} masih terlihat terasosiasi; "
@@ -413,7 +436,13 @@ def enter_monitor(iface, channel=None):
         )
     sh(["iw", "dev", iface, "set", "power_save", "off"], optional=True)
 
+    if _stop_requested:
+        return ""
+
     mon = create_monitor_iface(iface, channel)
+    if mon and _stop_requested:
+        delete_iface(mon)
+        return ""
     if mon:
         info = iface_info(mon)
         active = info_channel(info)
@@ -481,13 +510,30 @@ def enter_monitor(iface, channel=None):
 
 
 def handle_signal(signum, _frame):
-    global _child
+    """SIGTERM dari tombol Stop: hentikan tool, cleanup tetap dijalankan.
+
+    Sinyal kedua saat cleanup diabaikan agar restore managed tidak terpotong.
+    """
+    global _stop_requested
+    if _cleaning or _stop_requested:
+        return
+    _stop_requested = True
     out(f"[priv] Menerima sinyal {signum}, menghentikan proses...")
     if _child is not None and _child.poll() is None:
         try:
             _child.send_signal(signal.SIGTERM)
         except Exception:  # noqa: BLE001
             pass
+
+    def _force_kill():
+        time.sleep(8)
+        if _child is not None and _child.poll() is None:
+            try:
+                _child.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=_force_kill, daemon=True).start()
 
 
 def map_iface_args(args, base, mon):
@@ -511,7 +557,7 @@ def map_iface_args(args, base, mon):
 
 
 def monitor_run(iface, channel, tool, args):
-    global _child
+    global _child, _cleaning
 
     if not IFACE_RE.fullmatch(iface or ""):
         err(f"[priv] nama interface tidak valid: {iface!r}")
@@ -531,17 +577,21 @@ def monitor_run(iface, channel, tool, args):
         err("[priv] monitor-run harus dijalankan sebagai root (via sudo).")
         return 2
 
-    mon = enter_monitor(iface, channel or None)
-    if not mon:
-        return 3
-
-    tool_args = map_iface_args(args, iface, mon)
-
+    # Pasang handler SEBELUM mengubah mode interface, agar Stop saat proses
+    # persiapan pun tetap memicu restore managed mode.
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, handle_signal)
 
+    mon = ""
     rc = 1
     try:
+        mon = enter_monitor(iface, channel or None)
+        if _stop_requested:
+            return 130
+        if not mon:
+            return 3
+
+        tool_args = map_iface_args(args, iface, mon)
         out(f"[priv] $ {tool} {' '.join(tool_args)}".rstrip())
         _child = subprocess.Popen(  # noqa: S603 - argumen list, tanpa shell
             [path, *tool_args],
@@ -552,12 +602,17 @@ def monitor_run(iface, channel, tool, args):
         err(f"[priv] perintah tidak ditemukan: {tool}")
         rc = 127
     finally:
-        _child = None
-        restore_managed(iface)
+        # Jangan biarkan sinyal tambahan memotong restore.
+        _cleaning = True
+        try:
+            _child = None
+            restore_managed(iface)
+        finally:
+            _cleaning = False
 
     if rc < 0:
         rc = 128 + abs(rc)
-    return rc
+    return 130 if _stop_requested else rc
 
 
 def main(argv):

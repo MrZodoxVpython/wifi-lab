@@ -232,7 +232,7 @@ class MainWindow(QMainWindow):
         self.crack_btn = QPushButton("Crack capture")
         self.crack_btn.clicked.connect(self.crack_capture)
         self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.backend.stop)
+        self.stop_btn.clicked.connect(self.stop_attack)
         grid.addWidget(self.handshake_btn, 0, 0)
         grid.addWidget(self.wps_btn, 0, 1)
         grid.addWidget(self.reaver_btn, 1, 0)
@@ -321,7 +321,7 @@ class MainWindow(QMainWindow):
         tb.addAction(style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
                      "Settings", self.open_settings)
         tb.addSeparator()
-        tb.addAction("Stop", self.backend.stop)
+        tb.addAction("Stop", self.stop_attack)
 
     # ------------------------------------------------------------ helpers
     def log(self, msg):
@@ -492,6 +492,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.backend.restore()
 
+    def stop_attack(self):
+        """Stop tool; helper + backend memulihkan interface ke managed mode."""
+        if not self.backend.stop():
+            self.log("[system] tidak ada proses aktif untuk dihentikan.")
+            return
+        self.log("[system] Stop diminta — menghentikan tool dan memulihkan interface...")
+        self.statusBar().showMessage("Stopping and restoring interface...", 8000)
+
+    def closeEvent(self, event):
+        # Jangan tinggalkan adapter dalam monitor mode saat window ditutup.
+        self.backend.stop()
+        super().closeEvent(event)
+
     # ------------------------------------------------------------- attacks
     def _require_target(self):
         net = self.selected_network()
@@ -574,10 +587,13 @@ class MainWindow(QMainWindow):
         self.log(f"[result] {'OK' if ok else 'FAILED'}: {msg}")
         self.statusBar().showMessage(msg, 10000)
         self.refresh_captures()
-        if not ok:
-            QMessageBox.warning(self, APP_NAME, msg)
-        else:
+        if ok:
             QMessageBox.information(self, APP_NAME, msg)
+        elif msg.lower().startswith("dihentikan") or "dikembalikan ke managed" in msg.lower():
+            # Stop adalah aksi normal: tidak perlu dialog error.
+            return
+        else:
+            QMessageBox.warning(self, APP_NAME, msg)
 
     def refresh_captures(self):
         self.capture_list.clear()

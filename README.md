@@ -131,6 +131,17 @@ Stored at `~/.local/share/wifi-lab/config.json`:
   **Deauth** first, or verify the channel is correct.
 - **Reaver "no beacon"** — the AP may be on a different channel or have WPS
   locked/disabled. Re-scan and confirm WPS shows `yes (open)`.
+- **WiFi tertinggal `Soft blocked: yes` setelah klik Stop** — versi lama helper
+  mematikan seluruh radio (`nmcli radio wifi off`) dan bisa terbunuh sebelum
+  menyalakannya lagi. Perbaikan ada di helper terbaru; pasang ulang dengan
+  `sudo ./install.sh`. Untuk memulihkan sesi yang sedang bermasalah:
+  ```bash
+  sudo rfkill unblock wifi
+  sudo nmcli radio wifi on
+  ```
+  Helper baru tidak pernah mematikan radio; Stop hanya melepas interface,
+  menghentikan tool, lalu mengembalikan managed mode + menyambungkan kembali
+  profil WiFi yang tadi aktif.
 
 ### Passwordless sudo for the helper
 

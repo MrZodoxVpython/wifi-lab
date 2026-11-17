@@ -238,6 +238,9 @@ class WifiBackend(QObject):
         self.iface = self.config.get("interface", "wlan0")
         self._proc = None
         self._lock = threading.Lock()
+        # Di-set saat Stop ditekan; dipakai untuk memastikan interface tetap
+        # dipulihkan walau helper sempat terbunuh sebelum cleanup-nya selesai.
+        self._stop_requested = threading.Event()
 
     # --------------------------- safe signals ---------------------------
     def _safe_emit(self, signal, *args):
@@ -295,7 +298,7 @@ class WifiBackend(QObject):
         self.save_config()
 
     # --------------------------- process control ------------------------
-    def _kill_proc(self, proc, timeout=5):
+    def _kill_proc(self, proc, timeout=20):
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except Exception:
@@ -314,6 +317,33 @@ class WifiBackend(QObject):
                 except Exception:
                     pass
 
+    def _recover_interface(self, iface):
+        """Pulihkan interface lewat helper setelah Stop/timeout.
+
+        Helper sudah melakukan restore di blok finally, tetapi bila helper
+        terbunuh paksa (SIGKILL) cleanup-nya tidak sempat jalan. Pemanggilan
+        `restore` di sini idempoten: menyalakan radio, melepas soft-block,
+        mengembalikan nama interface, dan menyambungkan profil sebelumnya.
+        """
+        if not iface:
+            return False
+        self._emit_progress(f"[system] memulihkan {iface} ke managed mode...")
+        try:
+            rc, _ = self._run_helper(
+                ["restore", iface], on_line=self._emit_progress, timeout=120
+            )
+        except Exception as exc:
+            self._emit_progress(f"[system] gagal memulihkan {iface}: {exc}")
+            return False
+        if rc == 0:
+            self._emit_progress(f"[system] {iface} kembali ke managed mode.")
+            return True
+        self._emit_progress(
+            f"[system] peringatan: {iface} belum pulih sepenuhnya. "
+            f"Coba: Network → Restore interface atau `nmcli radio wifi on`."
+        )
+        return False
+
     def _run_helper(self, args, on_line=None, timeout=None):
         """Run helper as root; stream lines to on_line. Returns (rc, lines).
 
@@ -328,6 +358,10 @@ class WifiBackend(QObject):
                 "Helper root belum diotorisasi. Jalankan: sudo ./install.sh "
                 "(mengonfigurasi sudo NOPASSWD untuk wifi-lab-priv)."
             )
+        action = args[0] if args else ""
+        monitor_iface = ""
+        if action in ("monitor-run", "handshake") and len(args) > 1:
+            monitor_iface = args[1]
         cmd = ["sudo", "-n", helper] + args
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -361,14 +395,26 @@ class WifiBackend(QObject):
             with self._lock:
                 if self._proc is proc:
                     self._proc = None
+            # Helper normalnya sudah restore di finally. Ini pengaman untuk
+            # Stop/timeout yang membunuh helper sebelum cleanup selesai.
+            if monitor_iface and (
+                timed_out["hit"] or self._stop_requested.is_set()
+            ):
+                self._recover_interface(monitor_iface)
 
     def stop(self):
-        """Kill the active helper process tree."""
+        """Hentikan helper dan pastikan interface kembali ke managed mode.
+
+        SIGTERM membuat helper menghentikan tool lalu menjalankan cleanup
+        (restore managed mode). Bila helper tidak merespons, proses dibunuh
+        paksa; worker thread lalu memanggil `_recover_interface` sebagai
+        jaring pengaman.
+        """
         with self._lock:
             proc = self._proc
-            self._proc = None
-        if proc is None:
-            return
+        if proc is None or proc.poll() is not None:
+            return False
+        self._stop_requested.set()
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except Exception:
@@ -376,6 +422,21 @@ class WifiBackend(QObject):
                 proc.terminate()
             except Exception:
                 pass
+
+        def _escalate():
+            try:
+                proc.wait(timeout=45)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_escalate, daemon=True).start()
+        return True
 
     # ----------------------------- tool checks --------------------------
     def check_tools(self):
@@ -527,6 +588,7 @@ class WifiBackend(QObject):
         """Capture a WPA handshake from net (airodump + aireplay deauth)."""
         outprefix = os.path.join(CAPTURE_DIR, f"hs_{net.bssid.replace(':', '')}")
         timeout = int(self.config.get("capture_timeout", 120))
+        self._stop_requested.clear()
 
         def worker():
             try:
@@ -535,7 +597,10 @@ class WifiBackend(QObject):
                      net.bssid, outprefix, str(timeout)],
                     on_line=self._emit_progress,
                 )
-                if rc == 0 and any("HANDSHAKE_FOUND" in l for l in lines):
+                if self._stop_requested.is_set():
+                    self._emit_attack(
+                        False, "Dihentikan. Interface dikembalikan ke managed mode.")
+                elif rc == 0 and any("HANDSHAKE_FOUND" in l for l in lines):
                     self._emit_attack(True, "Handshake captured: " + outprefix + ".pcap")
                 else:
                     self._emit_attack(False,
@@ -554,13 +619,19 @@ class WifiBackend(QObject):
         else:
             args += ["-K", "1"]
         timeout = int(self.config.get("reaver_timeout", 600))
+        self._stop_requested.clear()
 
         def worker():
             try:
                 rc, lines = self._run_helper(
                     ["monitor-run", self.iface, net.channel or "-", "reaver"] + args,
                     on_line=self._emit_progress,
+                    timeout=timeout,
                 )
+                if self._stop_requested.is_set():
+                    self._emit_attack(
+                        False, "Dihentikan. Interface dikembalikan ke managed mode.")
+                    return
                 joined = "\n".join(lines)
                 if "WPS PIN:" in joined or "KEY FOUND" in joined:
                     self._emit_attack(True, "WPS PIN recovered (see log).")
@@ -578,6 +649,7 @@ class WifiBackend(QObject):
         if client:
             args += ["-c", client]
         args.append(self.iface)
+        self._stop_requested.clear()
 
         def worker():
             try:
@@ -585,7 +657,11 @@ class WifiBackend(QObject):
                     ["monitor-run", self.iface, net.channel or "-", "aireplay-ng"] + args,
                     on_line=self._emit_progress,
                 )
-                self._emit_attack(True, f"Deauth sent ({rc}); clients should drop.")
+                if self._stop_requested.is_set():
+                    self._emit_attack(
+                        False, "Dihentikan. Interface dikembalikan ke managed mode.")
+                else:
+                    self._emit_attack(True, f"Deauth sent ({rc}); clients should drop.")
             except Exception as exc:
                 self._emit_attack(False, str(exc))
         threading.Thread(target=worker, daemon=True).start()
@@ -600,6 +676,7 @@ class WifiBackend(QObject):
         if not os.path.isfile(capfile):
             self._emit_attack(False, f"Capture not found: {capfile}")
             return
+        self._stop_requested.clear()
 
         def worker():
             try:
@@ -607,6 +684,9 @@ class WifiBackend(QObject):
                     ["run", "aircrack-ng", "-w", wordlist, capfile],
                     on_line=self._emit_progress,
                 )
+                if self._stop_requested.is_set():
+                    self._emit_attack(False, "Dihentikan oleh operator.")
+                    return
                 joined = "\n".join(lines)
                 m = re.search(r"KEY FOUND!\s*\[\s*(.*?)\s*\]", joined)
                 if m:
@@ -620,10 +700,21 @@ class WifiBackend(QObject):
         threading.Thread(target=worker, daemon=True).start()
 
     def restore(self):
+        self._stop_requested.clear()
+
         def worker():
             try:
-                rc, lines = self._run_helper(["restore", self.iface])
-                self._emit_attack(rc == 0, "Interface restored to managed mode.")
+                rc, _ = self._run_helper(
+                    ["restore", self.iface],
+                    on_line=self._emit_progress,
+                    timeout=120,
+                )
+                if rc == 0:
+                    self._emit_attack(True, "Interface restored to managed mode.")
+                else:
+                    self._emit_attack(
+                        False,
+                        "Restore belum berhasil sepenuhnya. Cek: nmcli radio wifi on")
             except Exception as exc:
                 self._emit_attack(False, str(exc))
         threading.Thread(target=worker, daemon=True).start()
